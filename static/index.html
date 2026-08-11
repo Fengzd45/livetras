@@ -225,6 +225,7 @@ let reconnectTimer = null;
 let waveformAnimId = null;
 let waveformData = {};
 let speakingMap = {};
+let myCardId = 'user1'; // 自己所在的卡片 ID
 
 const cardGrid = document.getElementById('cardGrid');
 const actionBtn = document.getElementById('actionBtn');
@@ -361,7 +362,7 @@ function updateWaveform(id, amplitude) {
             stateEl.textContent = '🔊 说话';
             stateEl.className = 'state speaking';
             if (cardEl) cardEl.className = 'card speaking';
-        } else if (id === clientId && isConnected) {
+        } else if (id === myCardId && isConnected) {
             stateEl.textContent = '🎤 在线';
             stateEl.className = 'state online';
             if (cardEl) cardEl.className = 'card active';
@@ -380,7 +381,7 @@ function resetWaveform(id) {
     const stateEl = document.getElementById(`state-${id}`);
     const cardEl = document.getElementById(`card-${id}`);
     if (stateEl) {
-        if (id === clientId && isConnected) {
+        if (id === myCardId && isConnected) {
             stateEl.textContent = '🎤 在线';
             stateEl.className = 'state online';
             if (cardEl) cardEl.className = 'card active';
@@ -424,37 +425,41 @@ function feedAudioData(id, floatData) {
 }
 
 // ============================================================
-// 核心修复：强制重新绘制所有卡片
+// 核心修复：根据后端 id 映射到不同卡片
 // ============================================================
 function redrawAllCards(clients) {
-    // 清空所有卡片，重新绘制
+    // 重置所有卡片为空位状态
     CARD_IDS.forEach(id => {
         const card = document.getElementById(`card-${id}`);
         if (!card) return;
+        const defaultName = id === 'user1' ? 'user1' : id;
+        updateCardName(id, defaultName);
+        updateCardState(id, '⏳ 空位', 'waiting');
+        card.className = 'card';
+        setCardEmpty(id, true);
+        resetWaveform(id);
+    });
+    
+    // 根据后端返回的 clients 填充卡片（按顺序）
+    const onlineUsers = clients || [];
+    onlineUsers.forEach((user, index) => {
+        if (index >= CARD_IDS.length) return;
+        const cardId = CARD_IDS[index];
+        const userId = user.id || `user${index + 1}`;
         
-        // 找到该卡片在 clients 列表中的对应项
-        const found = clients.find(c => c.id === id);
+        updateCardName(cardId, userId);
+        updateCardState(cardId, '🎤 在线', 'online');
+        document.getElementById(`card-${cardId}`).className = 'card active';
+        setCardEmpty(cardId, false);
         
-        if (found) {
-            // 有人在线
-            updateCardName(id, found.id);
-            updateCardState(id, '🎤 在线', 'online');
-            card.className = 'card active';
-            setCardEmpty(id, false);
-        } else {
-            // 空位
-            const defaultName = id === 'user1' ? 'user1' : id;
-            updateCardName(id, defaultName);
-            updateCardState(id, '⏳ 空位', 'waiting');
-            card.className = 'card';
-            setCardEmpty(id, true);
-            resetWaveform(id);
+        // 如果这个用户是自己，记录自己的卡片位置
+        if (userId === clientId) {
+            myCardId = cardId;
         }
     });
     
     // 更新人数
-    const onlineCountNum = clients.length;
-    updateOnlineCount(onlineCountNum);
+    updateOnlineCount(onlineUsers.length);
 }
 
 // ============================================================
@@ -477,7 +482,8 @@ function connect() {
 
         const lang = detectLanguage(clientId);
         
-        // 先把自己显示在 user1 位置
+        // 先把自己显示在 user1 位置（临时）
+        myCardId = 'user1';
         updateCardName('user1', clientId);
         updateCardState('user1', '🎤 在线', 'online');
         document.getElementById(`card-user1`).className = 'card active';
@@ -493,25 +499,27 @@ function connect() {
     ws.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
-            console.log('收到消息:', data); // 调试日志
+            console.log('收到消息:', data);
             
             if (data.type === 'room_status') {
-                // 使用强制重绘函数
                 const clients = data.clients || [];
                 redrawAllCards(clients);
                 
                 // 确保自己的卡片正确显示
                 const myFound = clients.find(c => c.id === clientId);
                 if (myFound) {
-                    updateCardName('user1', myFound.id);
-                    updateCardState('user1', '🎤 在线', 'online');
-                    document.getElementById(`card-user1`).className = 'card active';
-                    setCardEmpty('user1', false);
+                    const myIndex = clients.indexOf(myFound);
+                    const myCard = CARD_IDS[myIndex] || 'user1';
+                    myCardId = myCard;
+                    updateCardName(myCard, myFound.id);
+                    updateCardState(myCard, '🎤 在线', 'online');
+                    document.getElementById(`card-${myCard}`).className = 'card active';
+                    setCardEmpty(myCard, false);
                 }
             } else if (data.type === 'translation') {
                 const text = data.text || '';
                 if (clientId && text) {
-                    appendMessage('user1', text);
+                    appendMessage(myCardId || 'user1', text);
                 }
                 if (data.audio) playAudio(data.audio);
             } else if (data.type === 'region_status') {
@@ -526,9 +534,9 @@ function connect() {
         isConnected = false;
         updateConnBadge(false);
         stopAudioCapture();
-        updateCardState('user1', '离线', 'waiting');
-        document.getElementById(`card-user1`).className = 'card';
-        resetWaveform('user1');
+        updateCardState(myCardId || 'user1', '离线', 'waiting');
+        document.getElementById(`card-${myCardId || 'user1'}`).className = 'card';
+        resetWaveform(myCardId || 'user1');
         showToast('❌ 已断开');
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => {
@@ -559,7 +567,7 @@ async function startAudioCapture() {
         processorNode.onaudioprocess = (ev) => {
             if (!isConnected) return;
             const inputData = ev.inputBuffer.getChannelData(0);
-            feedAudioData('user1', inputData);
+            feedAudioData(myCardId || 'user1', inputData);
             const pcm = floatTo16BitPCM(inputData);
             const b64 = arrayBufferToBase64(pcm);
             sendMsg({ type: 'audio', audio: b64 });
@@ -636,9 +644,12 @@ myNameInput.addEventListener('change', () => {
         const newName = myNameInput.value.trim() || '我';
         clientId = newName;
         const lang = detectLanguage(newName);
-        updateCardName('user1', newName);
-        sendMsg({ type: 'set_language', target_lang: lang });
-        showToast(`🔄 语言: ${lang}`);
+        // 更新自己所在卡片的姓名
+        if (myCardId) {
+            updateCardName(myCardId, newName);
+            sendMsg({ type: 'set_language', target_lang: lang });
+            showToast(`🔄 语言: ${lang}`);
+        }
     }
 });
 
@@ -646,7 +657,7 @@ myNameInput.addEventListener('change', () => {
 // 启动
 // ============================================================
 startWaveformLoop();
-console.log('🎙️ 四人会谈已加载 (修复版)');
+console.log('🎙️ 四人会谈已加载 (映射修复版)');
 </script>
 </body>
 </html>
