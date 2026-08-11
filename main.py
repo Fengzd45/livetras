@@ -42,19 +42,22 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
             if msg_type == "set_language":
                 target_lang = message.get("target_lang", "zh")
-                rooms[room_id]["languages"][client_id] = target_lang
-                logger.info(f"   {client_id} 目标语言: {target_lang}")
-                # 语言变更后也广播一次
-                await broadcast_room_status(room_id)
+                # 检查房间是否还存在
+                if room_id in rooms:
+                    rooms[room_id]["languages"][client_id] = target_lang
+                    logger.info(f"   {client_id} 目标语言: {target_lang}")
+                    await broadcast_room_status(room_id)
 
             elif msg_type == "set_region":
-                # 只记录日志，不做复杂处理（暂无地域切换逻辑）
                 logger.info(f"   {client_id} 地域: {message.get('region')}")
 
             elif msg_type == "audio":
-                # 收到音频，转发给所有其他客户端（简单回显）
                 audio_b64 = message.get("audio", "")
                 if not audio_b64:
+                    continue
+
+                # 检查房间是否存在
+                if room_id not in rooms:
                     continue
 
                 # 把音频和说话人信息广播给其他人
@@ -73,14 +76,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     except WebSocketDisconnect:
         logger.info(f"❌ {client_id} 断开连接")
     finally:
-        # 清理断开连接的客户端
+        # 清理断开连接的客户端（检查房间是否存在）
         if room_id in rooms:
             rooms[room_id]["clients"].pop(client_id, None)
             rooms[room_id]["languages"].pop(client_id, None)
             if not rooms[room_id]["clients"]:
                 del rooms[room_id]
-        # 广播更新后的状态
-        await broadcast_room_status(room_id)
+        # 广播更新后的状态（如果房间还存在）
+        if room_id in rooms:
+            await broadcast_room_status(room_id)
 
 async def broadcast_room_status(room_id: str):
     """向房间内所有客户端广播当前状态（人数、姓名列表）"""
