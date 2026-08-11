@@ -16,6 +16,7 @@
             align-items: center;
             padding: 12px;
         }
+
         .header {
             width: 100%;
             max-width: 800px;
@@ -33,6 +34,7 @@
         .header h1 { font-size: 20px; color: #7c9bff; letter-spacing: 1px; }
         .header .status { font-size: 14px; color: #aaa; }
         .header .status .count { color: #6fcf97; font-weight: 600; }
+
         .header .controls {
             display: flex;
             gap: 8px;
@@ -43,34 +45,37 @@
             background: #1e1e3a;
             color: #fff;
             border: 1px solid #333;
-            padding: 4px 10px;
+            padding: 5px 12px;
             border-radius: 8px;
-            font-size: 13px;
-            width: 110px;
+            font-size: 14px;
+            width: 130px;
+            outline: none;
         }
+        .header .controls input:focus { border-color: #4a6cf7; }
         .header .controls select {
             background: #1e1e3a;
             color: #fff;
             border: 1px solid #333;
-            padding: 4px 8px;
+            padding: 5px 10px;
             border-radius: 8px;
-            font-size: 12px;
+            font-size: 13px;
         }
         .header .controls button {
             background: #4a6cf7;
             border: none;
             color: #fff;
-            padding: 4px 14px;
+            padding: 5px 18px;
             border-radius: 8px;
             cursor: pointer;
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 600;
+            transition: 0.2s;
         }
         .header .controls button:hover { background: #5a7cf7; }
         .header .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
         .header .controls .badge {
-            font-size: 11px;
-            padding: 2px 10px;
+            font-size: 12px;
+            padding: 3px 12px;
             border-radius: 20px;
             background: #1a1a35;
             color: #666;
@@ -85,12 +90,13 @@
             width: 100%;
             max-width: 800px;
         }
+
         .card {
             background: #12122a;
             border-radius: 12px;
-            padding: 12px 14px;
+            padding: 10px 14px;
             border: 1px solid #222244;
-            min-height: 100px;
+            min-height: 90px;
             display: flex;
             flex-direction: column;
             transition: border-color 0.3s;
@@ -98,16 +104,15 @@
         .card.active { border-color: #4a6cf7; }
         .card.speaking { border-color: #f2a86a; box-shadow: 0 0 20px rgba(242, 168, 106, 0.08); }
 
-        /* 姓名行：姓名 + 波形 + 状态 */
         .card .row {
             display: flex;
             align-items: center;
             gap: 8px;
-            margin-bottom: 6px;
+            margin-bottom: 4px;
             flex-wrap: wrap;
         }
         .card .row .name {
-            font-size: 15px;
+            font-size: 16px;
             font-weight: 600;
             color: #c0d0ff;
             min-width: 60px;
@@ -135,7 +140,7 @@
         .card .row .wave .bar.loud { background: #f2a86a; height: 16px; }
         .card .row .state {
             font-size: 11px;
-            padding: 1px 10px;
+            padding: 2px 10px;
             border-radius: 20px;
             background: #1a1a35;
             color: #666;
@@ -148,17 +153,16 @@
         .card .row .state.waiting { background: #1a1a35; color: #666; }
         @keyframes pulse { 0% { opacity: 0.7; } 50% { opacity: 1; } 100% { opacity: 0.7; } }
 
-        /* 文字窗 - 只显示母语 */
         .card .scroll {
             flex: 1;
             overflow-y: auto;
-            max-height: 80px;
+            max-height: 70px;
             font-size: 14px;
-            line-height: 1.6;
+            line-height: 1.5;
             background: #08081a;
             border-radius: 6px;
             padding: 4px 8px;
-            min-height: 36px;
+            min-height: 32px;
             margin-top: 2px;
         }
         .card .scroll::-webkit-scrollbar { width: 3px; }
@@ -187,6 +191,7 @@
             max-width: 90%;
         }
         .toast.show { display: block; }
+
         @media (max-width: 550px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -196,12 +201,13 @@
     <h1>🎙️ 四人会谈</h1>
     <span class="status">👤 <span class="count" id="onlineCount">0</span>/4</span>
     <div class="controls">
-        <input type="text" id="myName" value="冯忠德" placeholder="你的名字">
+        <input type="text" id="myName" placeholder="输入你的姓名" value="冯忠德">
         <select id="regionSelect">
             <option value="cn">国内</option>
             <option value="intl">国际</option>
         </select>
         <span class="badge offline" id="connBadge">● 离线</span>
+        <button id="actionBtn">加入</button>
         <button id="leaveBtn" disabled>离开</button>
     </div>
 </div>
@@ -232,6 +238,7 @@ let waveformData = {};
 let speakingMap = {};
 
 const cardGrid = document.getElementById('cardGrid');
+const actionBtn = document.getElementById('actionBtn');
 const leaveBtn = document.getElementById('leaveBtn');
 const connBadge = document.getElementById('connBadge');
 const onlineCount = document.getElementById('onlineCount');
@@ -323,10 +330,12 @@ function updateConnBadge(online) {
     if (online) {
         connBadge.textContent = '● 在线';
         connBadge.className = 'badge online';
+        actionBtn.disabled = true;
         leaveBtn.disabled = false;
     } else {
         connBadge.textContent = '● 离线';
         connBadge.className = 'badge offline';
+        actionBtn.disabled = false;
         leaveBtn.disabled = true;
     }
 }
@@ -435,12 +444,13 @@ function connect() {
     const url = `${protocol}//${window.location.host}/ws/${ROOM_ID}/${encodeURIComponent(clientId)}`;
 
     updateConnBadge(false);
+    showToast('🔄 连接中...');
 
     ws = new WebSocket(url);
     ws.onopen = () => {
         isConnected = true;
         updateConnBadge(true);
-        showToast('✅ 已加入');
+        showToast(`✅ ${clientId} 已加入`);
 
         const lang = detectLanguage(clientId);
         updateCardName('user1', clientId);
@@ -590,6 +600,9 @@ function playAudio(b64) {
 // ============================================================
 // 事件绑定
 // ============================================================
+actionBtn.addEventListener('click', connect);
+myNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+
 leaveBtn.addEventListener('click', () => { if (ws) ws.close(); });
 
 regionSelect.addEventListener('change', () => {
@@ -603,4 +616,15 @@ myNameInput.addEventListener('change', () => {
         const lang = detectLanguage(newName);
         updateCardName('user1', newName);
         sendMsg({ type: 'set_language', target_lang: lang });
-        showToast(`🔄 语言:
+        showToast(`🔄 语言: ${lang}`);
+    }
+});
+
+// ============================================================
+// 启动
+// ============================================================
+startWaveformLoop();
+console.log('🎙️ 四人会谈已加载');
+</script>
+</body>
+</html>
