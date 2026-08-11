@@ -479,8 +479,10 @@ function connect() {
                         updateCardState(id, '🎤 在线', 'online');
                         document.getElementById(`card-${id}`).className = 'card active';
                         setCardEmpty(id, false);
-                    } else if (id !== clientId) {
-                        updateCardName(id, id);
+                    } else {
+                        // 空位
+                        const defaultName = id === 'user1' ? 'user1' : id;
+                        updateCardName(id, defaultName);
                         updateCardState(id, '⏳ 空位', 'waiting');
                         document.getElementById(`card-${id}`).className = 'card';
                         setCardEmpty(id, true);
@@ -497,7 +499,7 @@ function connect() {
             } else if (data.type === 'region_status') {
                 showToast(`🌐 ${data.msg}`);
             }
-        } catch (err) { console.error(err); }
+        } catch (err) { console.error('解析消息失败:', err); }
     };
 
     ws.onclose = () => {
