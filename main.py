@@ -19,8 +19,29 @@ rooms: Dict[str, Dict] = {}
 async def index():
     return FileResponse("static/index.html")
 
+@app.get("/room/{room_id}/status")
+async def get_room_status(room_id: str):
+    """获取房间状态"""
+    if room_id not in rooms:
+        return {"count": 0, "clients": []}
+    clients = rooms[room_id]["clients"]
+    return {
+        "count": len(clients),
+        "clients": [{"id": cid} for cid in clients.keys()]
+    }
+
 @app.websocket("/ws/{room_id}/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
+    # 满员检查
+    if room_id in rooms and len(rooms[room_id]["clients"]) >= 4:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": "会议已满（最多4人）"
+        }))
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     logger.info(f"✅ {client_id} 加入房间 {room_id}")
 
@@ -29,7 +50,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     rooms[room_id]["clients"][client_id] = websocket
     rooms[room_id]["languages"][client_id] = "zh"
 
-    # 延迟广播，确保新客户端能收到初始状态
     await asyncio.sleep(0.1)
     await broadcast_room_status(room_id)
 
