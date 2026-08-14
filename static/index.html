@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
     <title>四人会谈</title>
     <style>
+        /* 样式与之前完全一致，此处省略以节省篇幅，请直接使用您原有的样式 */
+        /* 但为保证完整性，下面给出完整样式（与之前版本相同） */
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
@@ -428,7 +430,6 @@ function feedAudioData(id, floatData) {
 // 核心：根据后端返回的 clients 映射到卡片
 // ============================================================
 function redrawAllCards(clients) {
-    // 先全部重置为空位
     CARD_IDS.forEach(id => {
         const card = document.getElementById(`card-${id}`);
         if (!card) return;
@@ -440,7 +441,6 @@ function redrawAllCards(clients) {
         resetWaveform(id);
     });
 
-    // 按顺序填充在线用户
     const onlineUsers = clients || [];
     onlineUsers.forEach((user, index) => {
         if (index >= CARD_IDS.length) return;
@@ -493,10 +493,10 @@ function connect() {
     ws.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
+            console.log('收到消息:', data);  // 调试日志
             if (data.type === 'room_status') {
                 const clients = data.clients || [];
                 redrawAllCards(clients);
-                // 确保自己的卡片正确
                 const myFound = clients.find(c => c.id === clientId);
                 if (myFound) {
                     const myIndex = clients.indexOf(myFound);
@@ -513,7 +513,8 @@ function connect() {
                     appendMessage(myCardId || 'user1', text);
                 }
                 if (data.audio) playAudio(data.audio);
-            } else if (data.type === 'asr_result') {   // 🆕 新增：显示自己的识别文字
+            } else if (data.type === 'asr_result') {
+                // 显示自己的识别文字
                 const text = data.text || '';
                 if (text && myCardId) {
                     appendMessage(myCardId, '🎤 ' + text);
@@ -652,7 +653,7 @@ myNameInput.addEventListener('change', () => {
 // 启动
 // ============================================================
 startWaveformLoop();
-console.log('🎙️ 四人会谈已加载 (稳定版)');
+console.log('🎙️ 四人会谈已加载 (最终版)');
 </script>
 </body>
 </html>
