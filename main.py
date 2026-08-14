@@ -5,12 +5,10 @@ import asyncio
 import logging
 import requests
 from typing import Dict
-from fastapi import FastAPI, WebSocketDisconnect, WebSocket  # <-- 这里增加了 WebSocket
+from fastapi import FastAPI, WebSocketDisconnect, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
-
-# ... 后续代码保持不变
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,19 +18,16 @@ SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
 if not SILICONFLOW_API_KEY:
     logger.warning("⚠️ 环境变量 SILICONFLOW_API_KEY 未设置！")
 
-# 硅基流动 API 端点
 SILICONFLOW_BASE = "https://api.siliconflow.cn/v1"
 ASR_URL = f"{SILICONFLOW_BASE}/audio/transcriptions"
 LLM_URL = f"{SILICONFLOW_BASE}/chat/completions"
 TTS_URL = f"{SILICONFLOW_BASE}/audio/speech"
 
-# 使用的模型（可自行更换）
-ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"          # 修正：原为 SenseVoic。eSmall
-LLM_MODEL = "deepseek-ai/DeepSeek-V3"  # 或 "Qwen/Qwen-3-8B" 等
+ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
+LLM_MODEL = "deepseek-ai/DeepSeek-V3"
 TTS_MODEL = "fnlp/MOSS-TTSD-v0.5"
-TTS_VOICE = "fnlp/MOSS-TTSD-v0.5:alex"  # 音色
+TTS_VOICE = "fnlp/MOSS-TTSD-v0.5:alex"
 
-# --- 应用状态 ---
 rooms: Dict[str, Dict] = {}
 
 @asynccontextmanager
@@ -48,10 +43,8 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 async def get_index():
     return FileResponse("static/index.html")
 
-# --- WebSocket 端点 ---
 @app.websocket("/ws/{room_id}/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
-    # 修复：此处必须是单独一行，不能有 pass 或其他语句
     await websocket.accept()
     logger.info(f"✅ 客户端 {client_id} 加入房间 {room_id}")
 
@@ -77,7 +70,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 if not audio_b64:
                     continue
 
-                # 获取该房间所有客户端的翻译目标语言（排除自己）
                 target_langs = {
                     cid: lang for cid, lang in rooms[room_id]["languages"].items()
                     if cid != client_id
@@ -85,7 +77,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 if not target_langs:
                     continue
 
-                # 异步处理：先识别文字，再分别翻译+合成
                 asyncio.create_task(
                     process_audio_and_translate(
                         audio_b64, target_langs, room_id, client_id
@@ -102,23 +93,13 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 del rooms[room_id]
         await broadcast_room_status(room_id)
 
-# --- 核心处理函数 ---
 async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, str],
                                       room_id: str, speaker_id: str):
-    """
-    1. 调用 ASR 识别文字
-    2. 对每个目标语言调用 LLM 翻译，再调用 TTS 合成
-    3. 将翻译结果（文字+音频）发送给对应客户端
-    """
     try:
-        # 解码 Base64 音频（16kHz 16bit PCM）
         pcm_bytes = base64.b64decode(audio_b64)
-
-        # 构建 WAV 头（便于 ASR 接口识别）
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
-        # ---- 1. 语音识别 ----
-        # 修正：model 应作为表单数据（data），而非文件
+        # ---- ASR ----
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
         data = {"model": ASR_MODEL}
         asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
@@ -133,7 +114,15 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
             return
         logger.info(f"识别文字: {original_text}")
 
-        # ---- 2. 对每个目标语言并行处理 ----
+        # ---- 🆕 向说话者本人发送识别结果 ----
+        if room_id in rooms and speaker_id in rooms[room_id]["clients"]:
+            speaker_ws = rooms[room_id]["clients"][speaker_id]
+            await speaker_ws.send_text(json.dumps({
+                "type": "asr_result",
+                "text": original_text
+            }))
+
+        # ---- 为每个目标语言翻译+合成 ----
         tasks = []
         for target_client_id, target_lang in target_langs.items():
             tasks.append(
@@ -149,11 +138,7 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
 async def translate_and_synthesize(text: str, target_lang: str,
                                    target_client_id: str, room_id: str,
                                    speaker_id: str):
-    """
-    翻译文字并合成语音，发送给指定客户端
-    """
     try:
-        # ---- 2a. 翻译 (LLM) ----
         prompt = f"将以下内容翻译成{target_lang}，只输出翻译结果：\n{text}"
         llm_headers = {
             "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
@@ -172,7 +157,6 @@ async def translate_and_synthesize(text: str, target_lang: str,
         translated_text = llm_result["choices"][0]["message"]["content"].strip()
         logger.info(f"翻译 ({target_lang}): {translated_text}")
 
-        # ---- 2b. 语音合成 (TTS) ----
         tts_headers = {
             "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
             "Content-Type": "application/json"
@@ -191,7 +175,6 @@ async def translate_and_synthesize(text: str, target_lang: str,
         audio_bytes = tts_resp.content
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
 
-        # ---- 2c. 发送给客户端 ----
         if room_id in rooms and target_client_id in rooms[room_id]["clients"]:
             target_ws = rooms[room_id]["clients"][target_client_id]
             response = {
@@ -208,7 +191,6 @@ async def translate_and_synthesize(text: str, target_lang: str,
 
 def build_wav_header(data_len: int, sample_rate: int = 16000,
                      channels: int = 1, bits_per_sample: int = 16) -> bytes:
-    """生成 WAV 文件头"""
     byte_rate = sample_rate * channels * bits_per_sample // 8
     block_align = channels * bits_per_sample // 8
     header = bytearray()
