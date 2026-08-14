@@ -325,27 +325,13 @@ function updateConnBadge(online) {
     } else {
         connBadge.textContent = '● 离线';
         connBadge.className = 'badge offline';
-        // 如果房间已满，保持按钮禁用，但不改变文本
-        if (!actionBtn.disabled) {
-            // 如果未满，启用
-            // 但这里先不处理，由 fetchRoomStatus 控制
-        }
+        actionBtn.disabled = false;
         leaveBtn.disabled = true;
     }
 }
 
 function updateOnlineCount(count) {
     onlineCount.textContent = count;
-    // 根据人数控制加入按钮
-    if (count >= 4) {
-        actionBtn.disabled = true;
-        actionBtn.textContent = '会议已满';
-    } else {
-        if (!isConnected) {
-            actionBtn.disabled = false;
-            actionBtn.textContent = '加入';
-        }
-    }
 }
 
 // ============================================================
@@ -442,6 +428,7 @@ function feedAudioData(id, floatData) {
 // 核心：根据后端返回的 clients 映射到卡片
 // ============================================================
 function redrawAllCards(clients) {
+    // 先全部重置为空位
     CARD_IDS.forEach(id => {
         const card = document.getElementById(`card-${id}`);
         if (!card) return;
@@ -453,6 +440,7 @@ function redrawAllCards(clients) {
         resetWaveform(id);
     });
 
+    // 按顺序填充在线用户
     const onlineUsers = clients || [];
     onlineUsers.forEach((user, index) => {
         if (index >= CARD_IDS.length) return;
@@ -471,58 +459,9 @@ function redrawAllCards(clients) {
 }
 
 // ============================================================
-// 获取房间状态（HTTP）
-// ============================================================
-async function fetchRoomStatus() {
-    try {
-        const resp = await fetch(`/room/${ROOM_ID}/status`);
-        if (!resp.ok) return;
-        const data = await resp.json();
-        const count = data.count || 0;
-        updateOnlineCount(count);
-        // 如果已满且未连接，禁用加入按钮
-        if (count >= 4 && !isConnected) {
-            actionBtn.disabled = true;
-            actionBtn.textContent = '会议已满';
-        } else if (!isConnected) {
-            actionBtn.disabled = false;
-            actionBtn.textContent = '加入';
-        }
-        // 如果已连接，但人数变化，重新绘制卡片（可能其他人加入）
-        if (isConnected) {
-            // 使用当前房间状态（由 WebSocket 负责更新）
-            // 这里可以不用处理，因为 room_status 会触发 redraw
-        }
-    } catch (e) {
-        console.error('获取房间状态失败:', e);
-    }
-}
-
-// ============================================================
 // WebSocket 连接
 // ============================================================
 function connect() {
-    // 先检查人数是否已满
-    fetch(`/room/${ROOM_ID}/status`)
-        .then(res => res.json())
-        .then(data => {
-            if (data.count >= 4) {
-                showToast('⚠️ 会议已满，无法加入', 3000);
-                updateOnlineCount(data.count);
-                actionBtn.disabled = true;
-                actionBtn.textContent = '会议已满';
-                return;
-            }
-            // 人数未满，执行连接
-            doConnect();
-        })
-        .catch(() => {
-            // 获取失败则继续尝试连接（后端会拒绝满员）
-            doConnect();
-        });
-}
-
-function doConnect() {
     const name = myNameInput.value.trim() || '我';
     clientId = name;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -549,21 +488,11 @@ function doConnect() {
 
         startAudioCapture();
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-        // 刷新一次状态，确保人数正确
-        fetchRoomStatus();
     };
 
     ws.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
-            if (data.type === 'error') {
-                showToast(`⚠️ ${data.message}`, 4000);
-                if (data.message.includes('满')) {
-                    actionBtn.disabled = true;
-                    actionBtn.textContent = '会议已满';
-                }
-                return;
-            }
             if (data.type === 'room_status') {
                 const clients = data.clients || [];
                 redrawAllCards(clients);
@@ -578,14 +507,17 @@ function doConnect() {
                     document.getElementById(`card-${myCard}`).className = 'card active';
                     setCardEmpty(myCard, false);
                 }
-                // 人数变化后，更新按钮状态
-                updateOnlineCount(clients.length);
             } else if (data.type === 'translation') {
                 const text = data.text || '';
                 if (clientId && text) {
                     appendMessage(myCardId || 'user1', text);
                 }
                 if (data.audio) playAudio(data.audio);
+            } else if (data.type === 'asr_result') {   // 🆕 新增：显示自己的识别文字
+                const text = data.text || '';
+                if (text && myCardId) {
+                    appendMessage(myCardId, '🎤 ' + text);
+                }
             } else if (data.type === 'region_status') {
                 showToast(`🌐 ${data.msg}`);
             }
@@ -604,10 +536,8 @@ function doConnect() {
         showToast('❌ 已断开');
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => {
-            if (!isConnected) { showToast('🔄 重连...'); doConnect(); }
+            if (!isConnected) { showToast('🔄 重连...'); connect(); }
         }, 5000);
-        // 刷新状态，更新按钮
-        fetchRoomStatus();
     };
 
     ws.onerror = () => {
@@ -722,12 +652,7 @@ myNameInput.addEventListener('change', () => {
 // 启动
 // ============================================================
 startWaveformLoop();
-console.log('🎙️ 四人会谈已加载 (满员检测版)');
-
-// 页面加载时获取房间状态
-window.addEventListener('load', fetchRoomStatus);
-// 每隔10秒刷新一次状态（可选）
-setInterval(fetchRoomStatus, 10000);
+console.log('🎙️ 四人会谈已加载 (稳定版)');
 </script>
 </body>
 </html>
