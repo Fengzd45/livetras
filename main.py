@@ -46,9 +46,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 async def get_index():
     return FileResponse("static/index.html")
 
-# --- WebSocket 端点（与原逻辑相同）---
+# --- WebSocket 端点 ---
 @app.websocket("/ws/{room_id}/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
+    # 修复：此处必须是单独一行，不能有 pass 或其他语句
     await websocket.accept()
     logger.info(f"✅ 客户端 {client_id} 加入房间 {room_id}")
 
@@ -99,7 +100,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 del rooms[room_id]
         await broadcast_room_status(room_id)
 
-# --- 核心处理函数（替代 translate_and_send）---
+# --- 核心处理函数 ---
 async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, str],
                                       room_id: str, speaker_id: str):
     """
@@ -151,7 +152,6 @@ async def translate_and_synthesize(text: str, target_lang: str,
     """
     try:
         # ---- 2a. 翻译 (LLM) ----
-        # 构建提示词
         prompt = f"将以下内容翻译成{target_lang}，只输出翻译结果：\n{text}"
         llm_headers = {
             "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
@@ -160,7 +160,7 @@ async def translate_and_synthesize(text: str, target_lang: str,
         llm_data = {
             "model": LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1  # 低温度保证准确性
+            "temperature": 0.1
         }
         llm_resp = requests.post(LLM_URL, headers=llm_headers, json=llm_data)
         if llm_resp.status_code != 200:
@@ -179,14 +179,13 @@ async def translate_and_synthesize(text: str, target_lang: str,
             "model": TTS_MODEL,
             "input": translated_text,
             "voice": TTS_VOICE,
-            "response_format": "wav",   # 返回 WAV 格式
+            "response_format": "wav",
             "stream": False
         }
         tts_resp = requests.post(TTS_URL, headers=tts_headers, json=tts_data)
         if tts_resp.status_code != 200:
             logger.error(f"TTS 失败: {tts_resp.text}")
             return
-        # 响应是二进制音频数据，转为 Base64
         audio_bytes = tts_resp.content
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
 
@@ -195,9 +194,9 @@ async def translate_and_synthesize(text: str, target_lang: str,
             target_ws = rooms[room_id]["clients"][target_client_id]
             response = {
                 "type": "translation",
-                "from": speaker_id,  # 说话人标识
+                "from": speaker_id,
                 "text": translated_text,
-                "audio": audio_b64,   # WAV 音频 Base64
+                "audio": audio_b64,
                 "lang": target_lang
             }
             await target_ws.send_text(json.dumps(response))
@@ -212,11 +211,11 @@ def build_wav_header(data_len: int, sample_rate: int = 16000,
     block_align = channels * bits_per_sample // 8
     header = bytearray()
     header.extend(b'RIFF')
-    header.extend((data_len + 36).to_bytes(4, 'little'))  # 文件大小-8
+    header.extend((data_len + 36).to_bytes(4, 'little'))
     header.extend(b'WAVE')
     header.extend(b'fmt ')
-    header.extend((16).to_bytes(4, 'little'))  # PCM 格式
-    header.extend((1).to_bytes(2, 'little'))   # PCM
+    header.extend((16).to_bytes(4, 'little'))
+    header.extend((1).to_bytes(2, 'little'))
     header.extend(channels.to_bytes(2, 'little'))
     header.extend(sample_rate.to_bytes(4, 'little'))
     header.extend(byte_rate.to_bytes(4, 'little'))
@@ -225,83 +224,6 @@ def build_wav_header(data_len: int, sample_rate: int = 16000,
     header.extend(b'data')
     header.extend(data_len.to_bytes(4, 'little'))
     return bytes(header)
-
-async def broadcast_room_status(room_id: str):
-    if room_id not in rooms:
-        return
-    clients = rooms[room_id]["clients"]
-    languages = rooms[room_id]["languages"]
-    status = {
-        "type": "room_status",
-        "clients": [
-            {"id": cid, "lang": languages.get(cid, "未设置")}
-            for cid in clients.keys()
-        ]
-    }
-    for ws in clients.values():
-        try:
-            await ws.send_text(json.dumps(status))
-        except:
-            pass        await websocket.accept()
-        await websocket.send_text(json.dumps({
-            "type": "error",
-            "message": "会议已满（最多4人）"
-        }))
-        await websocket.close(code=1008)
-        return
-
-    await websocket.accept()
-    logger.info(f"✅ {client_id} 加入房间 {room_id}")
-
-    if room_id not in rooms:
-        rooms[room_id] = {"clients": {}, "languages": {}}
-    rooms[room_id]["clients"][client_id] = websocket
-    rooms[room_id]["languages"][client_id] = "zh"
-
-    await asyncio.sleep(0.1)
-    await broadcast_room_status(room_id)
-
-    try:
-        while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            msg_type = message.get("type")
-
-            if msg_type == "set_language":
-                target_lang = message.get("target_lang", "zh")
-                if room_id in rooms:
-                    rooms[room_id]["languages"][client_id] = target_lang
-                    await broadcast_room_status(room_id)
-
-            elif msg_type == "set_region":
-                logger.info(f"   {client_id} 地域: {message.get('region')}")
-
-            elif msg_type == "audio":
-                audio_b64 = message.get("audio", "")
-                if not audio_b64 or room_id not in rooms:
-                    continue
-                for cid, ws in rooms[room_id]["clients"].items():
-                    if cid != client_id:
-                        try:
-                            await ws.send_text(json.dumps({
-                                "type": "translation",
-                                "from": client_id,
-                                "text": "[翻译] 收到音频",
-                                "audio": audio_b64
-                            }))
-                        except:
-                            pass
-
-    except WebSocketDisconnect:
-        logger.info(f"❌ {client_id} 断开连接")
-    finally:
-        if room_id in rooms:
-            rooms[room_id]["clients"].pop(client_id, None)
-            rooms[room_id]["languages"].pop(client_id, None)
-            if not rooms[room_id]["clients"]:
-                del rooms[room_id]
-            else:
-                await broadcast_room_status(room_id)
 
 async def broadcast_room_status(room_id: str):
     if room_id not in rooms:
