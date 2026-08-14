@@ -100,10 +100,12 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
         # ---- ASR ----
+        params = {"model": ASR_MODEL}  # 将 model 放在 URL 参数中
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
-        data = {"model": ASR_MODEL}
         asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
-        asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, data=data)
+        asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, params=params)
+        logger.info(f"ASR status: {asr_resp.status_code}, response: {asr_resp.text}")
+
         if asr_resp.status_code != 200:
             logger.error(f"ASR 失败: {asr_resp.text}")
             return
@@ -114,15 +116,16 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
             return
         logger.info(f"识别文字: {original_text}")
 
-        # ---- 🆕 向说话者本人发送识别结果 ----
+        # ---- 向说话者本人发送识别结果 ----
         if room_id in rooms and speaker_id in rooms[room_id]["clients"]:
             speaker_ws = rooms[room_id]["clients"][speaker_id]
             await speaker_ws.send_text(json.dumps({
                 "type": "asr_result",
                 "text": original_text
             }))
+            logger.info(f"✅ 已向 {speaker_id} 发送识别结果: {original_text}")
 
-        # ---- 为每个目标语言翻译+合成 ----
+        # ---- 翻译任务 ----
         tasks = []
         for target_client_id, target_lang in target_langs.items():
             tasks.append(
