@@ -5,10 +5,12 @@ import asyncio
 import logging
 import requests
 from typing import Dict
-from fastapi import FastAPI, WebSocketDisconnect
+from fastapi import FastAPI, WebSocketDisconnect, WebSocket  # <-- 这里增加了 WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
+
+# ... 后续代码保持不变
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
