@@ -76,9 +76,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                     if cid != client_id
                 }
                 
-                # 即使没有翻译目标，也至少显示自己的识别文字
                 if not target_langs:
-                    # 只进行 ASR 识别，不翻译
                     asyncio.create_task(
                         process_audio_only(audio_b64, room_id, client_id)
                     )
@@ -105,8 +103,17 @@ async def process_audio_only(audio_b64: str, room_id: str, speaker_id: str):
         pcm_bytes = base64.b64decode(audio_b64)
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
-        # ---- ASR ----
+        # 获取用户的语言设置
+        user_lang = rooms[room_id]["languages"].get(speaker_id, "auto")
+        
+        # 构建 ASR 参数
         params = {"model": ASR_MODEL}
+        if user_lang and user_lang != "auto":
+            params["language"] = user_lang
+            logger.info(f"使用语言: {user_lang} 进行识别")
+        else:
+            logger.info("使用自动语言检测")
+        
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
         asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
         asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, params=params)
@@ -140,8 +147,17 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
         pcm_bytes = base64.b64decode(audio_b64)
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
-        # ---- ASR ----
+        # 获取用户的语言设置
+        user_lang = rooms[room_id]["languages"].get(speaker_id, "auto")
+        
+        # 构建 ASR 参数
         params = {"model": ASR_MODEL}
+        if user_lang and user_lang != "auto":
+            params["language"] = user_lang
+            logger.info(f"使用语言: {user_lang} 进行识别")
+        else:
+            logger.info("使用自动语言检测")
+        
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
         asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
         asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, params=params)
@@ -183,7 +199,20 @@ async def translate_and_synthesize(text: str, target_lang: str,
                                    target_client_id: str, room_id: str,
                                    speaker_id: str):
     try:
-        prompt = f"将以下内容翻译成{target_lang}，只输出翻译结果：\n{text}"
+        # 获取目标语言名称
+        lang_names = {
+            "zh": "中文",
+            "en": "英文",
+            "ja": "日语",
+            "ko": "韩语",
+            "fr": "法语",
+            "de": "德语",
+            "es": "西班牙语",
+            "ru": "俄语"
+        }
+        lang_name = lang_names.get(target_lang, target_lang)
+        
+        prompt = f"将以下内容翻译成{lang_name}，只输出翻译结果：\n{text}"
         llm_headers = {
             "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
             "Content-Type": "application/json"
