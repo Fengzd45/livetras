@@ -23,7 +23,8 @@ ASR_URL = f"{SILICONFLOW_BASE}/audio/transcriptions"
 LLM_URL = f"{SILICONFLOW_BASE}/chat/completions"
 TTS_URL = f"{SILICONFLOW_BASE}/audio/speech"
 
-ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
+# 尝试 TeleSpeechASR（对中文支持可能更好）
+ASR_MODEL = "TeleAI/TeleSpeechASR"
 LLM_MODEL = "deepseek-ai/DeepSeek-V3"
 TTS_MODEL = "fnlp/MOSS-TTSD-v0.5"
 TTS_VOICE = "fnlp/MOSS-TTSD-v0.5:alex"
