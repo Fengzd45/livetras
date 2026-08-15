@@ -66,6 +66,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 await broadcast_room_status(room_id)
 
             elif msg_type == "audio":
+                # 【关键日志】确认后端收到音频
+                logger.info(f"🎤 收到 {client_id} 的音频数据")
                 audio_b64 = message.get("audio", "")
                 if not audio_b64:
                     continue
@@ -100,7 +102,7 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
         # ---- ASR ----
-        params = {"model": ASR_MODEL}  # 将 model 放在 URL 参数中
+        params = {"model": ASR_MODEL}
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
         asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
         asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, params=params)
