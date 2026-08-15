@@ -66,7 +66,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 await broadcast_room_status(room_id)
 
             elif msg_type == "audio":
-                # 【关键日志】确认后端收到音频
                 logger.info(f"🎤 收到 {client_id} 的音频数据")
                 audio_b64 = message.get("audio", "")
                 if not audio_b64:
@@ -76,14 +75,19 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                     cid: lang for cid, lang in rooms[room_id]["languages"].items()
                     if cid != client_id
                 }
+                
+                # 即使没有翻译目标，也至少显示自己的识别文字
                 if not target_langs:
-                    continue
-
-                asyncio.create_task(
-                    process_audio_and_translate(
-                        audio_b64, target_langs, room_id, client_id
+                    # 只进行 ASR 识别，不翻译
+                    asyncio.create_task(
+                        process_audio_only(audio_b64, room_id, client_id)
                     )
-                )
+                else:
+                    asyncio.create_task(
+                        process_audio_and_translate(
+                            audio_b64, target_langs, room_id, client_id
+                        )
+                    )
 
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
@@ -94,6 +98,41 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             if not rooms[room_id]["clients"]:
                 del rooms[room_id]
         await broadcast_room_status(room_id)
+
+async def process_audio_only(audio_b64: str, room_id: str, speaker_id: str):
+    """仅进行 ASR 识别，不翻译，只向说话者本人发送识别结果"""
+    try:
+        pcm_bytes = base64.b64decode(audio_b64)
+        wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
+
+        # ---- ASR ----
+        params = {"model": ASR_MODEL}
+        files = {"file": ("audio.wav", wav_data, "audio/wav")}
+        asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
+        asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, params=params)
+        logger.info(f"ASR status (only): {asr_resp.status_code}, response: {asr_resp.text}")
+
+        if asr_resp.status_code != 200:
+            logger.error(f"ASR 失败: {asr_resp.text}")
+            return
+        asr_result = asr_resp.json()
+        original_text = asr_result.get("text", "").strip()
+        if not original_text:
+            logger.warning("ASR 返回空文本")
+            return
+        logger.info(f"识别文字 (仅自己): {original_text}")
+
+        # ---- 向说话者本人发送识别结果 ----
+        if room_id in rooms and speaker_id in rooms[room_id]["clients"]:
+            speaker_ws = rooms[room_id]["clients"][speaker_id]
+            await speaker_ws.send_text(json.dumps({
+                "type": "asr_result",
+                "text": original_text
+            }))
+            logger.info(f"✅ 已向 {speaker_id} 发送识别结果: {original_text}")
+
+    except Exception as e:
+        logger.error(f"仅识别处理失败: {e}")
 
 async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, str],
                                       room_id: str, speaker_id: str):
