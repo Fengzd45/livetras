@@ -9,6 +9,9 @@ from fastapi import FastAPI, WebSocketDisconnect, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
+import speech_recognition as sr
+from pydub import AudioSegment
+import io
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,34 +22,21 @@ if not SILICONFLOW_API_KEY:
     logger.warning("⚠️ 环境变量 SILICONFLOW_API_KEY 未设置！")
 
 SILICONFLOW_BASE = "https://api.siliconflow.cn/v1"
-ASR_URL = f"{SILICONFLOW_BASE}/audio/transcriptions"
 LLM_URL = f"{SILICONFLOW_BASE}/chat/completions"
 TTS_URL = f"{SILICONFLOW_BASE}/audio/speech"
 
-# 使用 SenseVoiceSmall，并映射语言代码
-ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
 LLM_MODEL = "deepseek-ai/DeepSeek-V3"
 TTS_MODEL = "fnlp/MOSS-TTSD-v0.5"
 TTS_VOICE = "fnlp/MOSS-TTSD-v0.5:alex"
 
-rooms: Dict[str, Dict] = {}
+# Google 语音识别语言代码
+RECOGNIZER_LANG = "zh-CN"  # 中文简体
 
-# 语言代码映射（前端选择 -> ASR 模型接受的代码）
-LANG_MAP = {
-    "zh": "cmn",      # 普通话
-    "en": "en",
-    "ja": "ja",
-    "ko": "ko",
-    "fr": "fr",
-    "de": "de",
-    "es": "es",
-    "ru": "ru",
-    "auto": "auto"
-}
+rooms: Dict[str, Dict] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 同声传译服务器启动（硅基流动版）")
+    logger.info("🚀 同声传译服务器启动（Google ASR 版）")
     yield
     logger.info("🛑 服务器关闭")
 
@@ -111,43 +101,39 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 del rooms[room_id]
         await broadcast_room_status(room_id)
 
+def recognize_speech(wav_data: bytes) -> str:
+    """使用 Google Speech Recognition 识别音频"""
+    recognizer = sr.Recognizer()
+    try:
+        audio_segment = AudioSegment.from_wav(io.BytesIO(wav_data))
+        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
+        wav_io = io.BytesIO()
+        audio_segment.export(wav_io, format="wav")
+        wav_io.seek(0)
+        with sr.AudioFile(wav_io) as source:
+            audio = recognizer.record(source)
+        text = recognizer.recognize_google(audio, language=RECOGNIZER_LANG)
+        return text
+    except sr.UnknownValueError:
+        logger.warning("Google ASR 无法识别语音")
+        return ""
+    except sr.RequestError as e:
+        logger.error(f"Google ASR 请求失败: {e}")
+        return ""
+    except Exception as e:
+        logger.error(f"ASR 处理异常: {e}")
+        return ""
+
 async def process_audio_only(audio_b64: str, room_id: str, speaker_id: str):
-    """仅进行 ASR 识别，不翻译，只向说话者本人发送识别结果"""
     try:
         pcm_bytes = base64.b64decode(audio_b64)
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
-        # 获取用户的语言设置并映射
-        user_lang = rooms[room_id]["languages"].get(speaker_id, "auto")
-        actual_lang = LANG_MAP.get(user_lang, "auto")
-        
-        # 构建 ASR 参数
-        params = {"model": ASR_MODEL}
-        if actual_lang and actual_lang != "auto":
-            params["language"] = actual_lang
-            logger.info(f"使用映射后的语言: {actual_lang} (原始: {user_lang}) 进行识别")
-        else:
-            logger.info("使用自动语言检测")
-        
-        # 添加 task 参数
-        params["task"] = "transcribe"
-        
-        files = {"file": ("audio.wav", wav_data, "audio/wav")}
-        asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
-        asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, params=params)
-        logger.info(f"ASR status (only): {asr_resp.status_code}, response: {asr_resp.text}")
-
-        if asr_resp.status_code != 200:
-            logger.error(f"ASR 失败: {asr_resp.text}")
-            return
-        asr_result = asr_resp.json()
-        original_text = asr_result.get("text", "").strip()
+        original_text = recognize_speech(wav_data)
         if not original_text:
-            logger.warning("ASR 返回空文本")
             return
         logger.info(f"识别文字 (仅自己): {original_text}")
 
-        # ---- 向说话者本人发送识别结果 ----
         if room_id in rooms and speaker_id in rooms[room_id]["clients"]:
             speaker_ws = rooms[room_id]["clients"][speaker_id]
             await speaker_ws.send_text(json.dumps({
@@ -165,36 +151,11 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
         pcm_bytes = base64.b64decode(audio_b64)
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
-        # 获取用户的语言设置并映射
-        user_lang = rooms[room_id]["languages"].get(speaker_id, "auto")
-        actual_lang = LANG_MAP.get(user_lang, "auto")
-        
-        # 构建 ASR 参数
-        params = {"model": ASR_MODEL}
-        if actual_lang and actual_lang != "auto":
-            params["language"] = actual_lang
-            logger.info(f"使用映射后的语言: {actual_lang} (原始: {user_lang}) 进行识别")
-        else:
-            logger.info("使用自动语言检测")
-        
-        params["task"] = "transcribe"
-        
-        files = {"file": ("audio.wav", wav_data, "audio/wav")}
-        asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
-        asr_resp = requests.post(ASR_URL, headers=asr_headers, files=files, params=params)
-        logger.info(f"ASR status: {asr_resp.status_code}, response: {asr_resp.text}")
-
-        if asr_resp.status_code != 200:
-            logger.error(f"ASR 失败: {asr_resp.text}")
-            return
-        asr_result = asr_resp.json()
-        original_text = asr_result.get("text", "").strip()
+        original_text = recognize_speech(wav_data)
         if not original_text:
-            logger.warning("ASR 返回空文本")
             return
         logger.info(f"识别文字: {original_text}")
 
-        # ---- 向说话者本人发送识别结果 ----
         if room_id in rooms and speaker_id in rooms[room_id]["clients"]:
             speaker_ws = rooms[room_id]["clients"][speaker_id]
             await speaker_ws.send_text(json.dumps({
@@ -203,7 +164,6 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
             }))
             logger.info(f"✅ 已向 {speaker_id} 发送识别结果: {original_text}")
 
-        # ---- 翻译任务 ----
         tasks = []
         for target_client_id, target_lang in target_langs.items():
             tasks.append(
@@ -220,7 +180,6 @@ async def translate_and_synthesize(text: str, target_lang: str,
                                    target_client_id: str, room_id: str,
                                    speaker_id: str):
     try:
-        # 获取目标语言名称
         lang_names = {
             "zh": "中文",
             "en": "英文",
