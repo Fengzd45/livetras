@@ -557,13 +557,24 @@ function sendMsg(data) {
 }
 
 // ============================================================
-// 音频采集
+// 音频采集（修正版：强制 16000Hz + 音量检测）
 // ============================================================
 async function startAudioCapture() {
     try {
         console.log('🎤 开始初始化音频...');
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 16000
+        });
+        console.log('✅ AudioContext 采样率:', audioCtx.sampleRate);
+        
+        mediaStream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+                sampleRate: 16000,
+                channelCount: 1,
+                echoCancellation: false,
+                noiseSuppression: false
+            }
+        });
         console.log('✅ 麦克风已获取');
         sourceNode = audioCtx.createMediaStreamSource(mediaStream);
 
@@ -573,20 +584,29 @@ async function startAudioCapture() {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             
             const inputData = ev.inputBuffer.getChannelData(0);
+            
+            // 检测音量，静音时跳过
+            let sum = 0;
+            for (let i = 0; i < inputData.length; i++) {
+                sum += inputData[i] * inputData[i];
+            }
+            const rms = Math.sqrt(sum / inputData.length);
+            if (rms < 0.005) return; // 静音跳过
+            
             feedAudioData(myCardId || 'user1', inputData);
             const pcm = floatTo16BitPCM(inputData);
             const b64 = arrayBufferToBase64(pcm);
             
             audioSendCount++;
-            if (audioSendCount % 50 === 0) {
-                console.log('🎤 发送音频数据，次数:', audioSendCount);
+            if (audioSendCount % 30 === 0) {
+                console.log('🎤 发送音频，音量:', rms.toFixed(4));
             }
             sendMsg({ type: 'audio', audio: b64 });
         };
 
         sourceNode.connect(processorNode);
         processorNode.connect(audioCtx.destination);
-        console.log('✅ 音频采集已启动');
+        console.log('✅ 音频采集已启动 (16000Hz)');
     } catch (err) {
         showToast('⚠️ 麦克风被拒绝');
         console.error('❌ 音频初始化失败:', err);
@@ -603,7 +623,7 @@ function stopAudioCapture() {
 }
 
 // ============================================================
-// 音频工具（修正版）
+// 音频工具
 // ============================================================
 function floatTo16BitPCM(float32Array) {
     const pcm = new Int16Array(float32Array.length);
