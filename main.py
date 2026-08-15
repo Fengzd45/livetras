@@ -9,8 +9,6 @@ from fastapi import FastAPI, WebSocketDisconnect, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
-import speech_recognition as sr
-from pydub import AudioSegment
 import io
 
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +19,10 @@ SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
 if not SILICONFLOW_API_KEY:
     logger.warning("⚠️ 环境变量 SILICONFLOW_API_KEY 未设置！")
 
+HF_TOKEN = os.environ.get("HF_TOKEN")
+if not HF_TOKEN:
+    logger.warning("⚠️ 环境变量 HF_TOKEN 未设置！")
+
 SILICONFLOW_BASE = "https://api.siliconflow.cn/v1"
 LLM_URL = f"{SILICONFLOW_BASE}/chat/completions"
 TTS_URL = f"{SILICONFLOW_BASE}/audio/speech"
@@ -29,14 +31,14 @@ LLM_MODEL = "deepseek-ai/DeepSeek-V3"
 TTS_MODEL = "fnlp/MOSS-TTSD-v0.5"
 TTS_VOICE = "fnlp/MOSS-TTSD-v0.5:alex"
 
-# Google 语音识别语言代码
-RECOGNIZER_LANG = "zh-CN"  # 中文简体
+# HuggingFace Whisper API 配置
+HF_WHISPER_API = "https://api-inference.huggingface.co/models/openai/whisper-small"
 
 rooms: Dict[str, Dict] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 同声传译服务器启动（Google ASR 版）")
+    logger.info("🚀 同声传译服务器启动（HuggingFace Whisper 版）")
     yield
     logger.info("🛑 服务器关闭")
 
@@ -101,27 +103,38 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 del rooms[room_id]
         await broadcast_room_status(room_id)
 
+# ----- 使用 HuggingFace Whisper 进行语音识别 -----
 def recognize_speech(wav_data: bytes) -> str:
-    """使用 Google Speech Recognition 识别音频"""
-    recognizer = sr.Recognizer()
+    """使用 HuggingFace 推理 API (Whisper) 识别音频"""
+    if not HF_TOKEN:
+        logger.error("HF_TOKEN 环境变量未设置，无法识别")
+        return ""
+    
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     try:
-        audio_segment = AudioSegment.from_wav(io.BytesIO(wav_data))
-        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
-        wav_io = io.BytesIO()
-        audio_segment.export(wav_io, format="wav")
-        wav_io.seek(0)
-        with sr.AudioFile(wav_io) as source:
-            audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio, language=RECOGNIZER_LANG)
-        return text
-    except sr.UnknownValueError:
-        logger.warning("Google ASR 无法识别语音")
-        return ""
-    except sr.RequestError as e:
-        logger.error(f"Google ASR 请求失败: {e}")
-        return ""
+        # 注意：API 期望直接发送音频二进制数据，需指定 Content-Type
+        # 但 requests 默认会使用 'application/octet-stream'，可以
+        response = requests.post(
+            HF_WHISPER_API,
+            headers=headers,
+            data=wav_data,
+            timeout=60
+        )
+        if response.status_code == 200:
+            result = response.json()
+            text = result.get("text", "").strip()
+            if text:
+                logger.info(f"HF Whisper 识别结果: {text}")
+                return text
+            else:
+                logger.warning("HF Whisper 返回空文本")
+                return ""
+        else:
+            logger.error(f"HF API 失败: {response.status_code} {response.text}")
+            # 如果是 503 或 504，可能是模型加载中，可稍后重试
+            return ""
     except Exception as e:
-        logger.error(f"ASR 处理异常: {e}")
+        logger.error(f"HF ASR 异常: {e}")
         return ""
 
 async def process_audio_only(audio_b64: str, room_id: str, speaker_id: str):
