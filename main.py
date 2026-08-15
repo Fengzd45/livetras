@@ -23,13 +23,26 @@ ASR_URL = f"{SILICONFLOW_BASE}/audio/transcriptions"
 LLM_URL = f"{SILICONFLOW_BASE}/chat/completions"
 TTS_URL = f"{SILICONFLOW_BASE}/audio/speech"
 
-# 尝试 TeleSpeechASR（对中文支持可能更好）
-ASR_MODEL = "TeleAI/TeleSpeechASR"
+# 使用 SenseVoiceSmall，并映射语言代码
+ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
 LLM_MODEL = "deepseek-ai/DeepSeek-V3"
 TTS_MODEL = "fnlp/MOSS-TTSD-v0.5"
 TTS_VOICE = "fnlp/MOSS-TTSD-v0.5:alex"
 
 rooms: Dict[str, Dict] = {}
+
+# 语言代码映射（前端选择 -> ASR 模型接受的代码）
+LANG_MAP = {
+    "zh": "cmn",      # 普通话
+    "en": "en",
+    "ja": "ja",
+    "ko": "ko",
+    "fr": "fr",
+    "de": "de",
+    "es": "es",
+    "ru": "ru",
+    "auto": "auto"
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -104,16 +117,20 @@ async def process_audio_only(audio_b64: str, room_id: str, speaker_id: str):
         pcm_bytes = base64.b64decode(audio_b64)
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
-        # 获取用户的语言设置
+        # 获取用户的语言设置并映射
         user_lang = rooms[room_id]["languages"].get(speaker_id, "auto")
+        actual_lang = LANG_MAP.get(user_lang, "auto")
         
         # 构建 ASR 参数
         params = {"model": ASR_MODEL}
-        if user_lang and user_lang != "auto":
-            params["language"] = user_lang
-            logger.info(f"使用语言: {user_lang} 进行识别")
+        if actual_lang and actual_lang != "auto":
+            params["language"] = actual_lang
+            logger.info(f"使用映射后的语言: {actual_lang} (原始: {user_lang}) 进行识别")
         else:
             logger.info("使用自动语言检测")
+        
+        # 添加 task 参数
+        params["task"] = "transcribe"
         
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
         asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
@@ -148,16 +165,19 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
         pcm_bytes = base64.b64decode(audio_b64)
         wav_data = build_wav_header(len(pcm_bytes), sample_rate=16000) + pcm_bytes
 
-        # 获取用户的语言设置
+        # 获取用户的语言设置并映射
         user_lang = rooms[room_id]["languages"].get(speaker_id, "auto")
+        actual_lang = LANG_MAP.get(user_lang, "auto")
         
         # 构建 ASR 参数
         params = {"model": ASR_MODEL}
-        if user_lang and user_lang != "auto":
-            params["language"] = user_lang
-            logger.info(f"使用语言: {user_lang} 进行识别")
+        if actual_lang and actual_lang != "auto":
+            params["language"] = actual_lang
+            logger.info(f"使用映射后的语言: {actual_lang} (原始: {user_lang}) 进行识别")
         else:
             logger.info("使用自动语言检测")
+        
+        params["task"] = "transcribe"
         
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
         asr_headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}"}
