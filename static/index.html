@@ -5,8 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
     <title>四人会谈</title>
     <style>
-        /* 样式与之前完全一致，此处省略以节省篇幅，请直接使用您原有的样式 */
-        /* 但为保证完整性，下面给出完整样式（与之前版本相同） */
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
@@ -228,6 +226,7 @@ let waveformAnimId = null;
 let waveformData = {};
 let speakingMap = {};
 let myCardId = 'user1';
+let audioSendCount = 0;
 
 const cardGrid = document.getElementById('cardGrid');
 const actionBtn = document.getElementById('actionBtn');
@@ -472,6 +471,7 @@ function connect() {
 
     ws = new WebSocket(url);
     ws.onopen = () => {
+        console.log('✅ WebSocket 连接已打开');
         isConnected = true;
         updateConnBadge(true);
         showToast(`✅ ${clientId} 已加入`);
@@ -486,6 +486,7 @@ function connect() {
         sendMsg({ type: 'set_region', region: regionSelect.value });
         sendMsg({ type: 'set_language', target_lang: lang });
 
+        // 启动音频采集（此时 isConnected 已为 true）
         startAudioCapture();
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     };
@@ -493,7 +494,7 @@ function connect() {
     ws.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
-            console.log('收到消息:', data);  // 调试日志
+            console.log('收到消息:', data);
             if (data.type === 'room_status') {
                 const clients = data.clients || [];
                 redrawAllCards(clients);
@@ -514,7 +515,6 @@ function connect() {
                 }
                 if (data.audio) playAudio(data.audio);
             } else if (data.type === 'asr_result') {
-                // 显示自己的识别文字
                 const text = data.text || '';
                 if (text && myCardId) {
                     appendMessage(myCardId, '🎤 ' + text);
@@ -528,6 +528,7 @@ function connect() {
     };
 
     ws.onclose = () => {
+        console.log('❌ WebSocket 连接已关闭');
         isConnected = false;
         updateConnBadge(false);
         stopAudioCapture();
@@ -542,13 +543,18 @@ function connect() {
     };
 
     ws.onerror = () => {
+        console.error('❌ WebSocket 错误');
         updateConnBadge(false);
         showToast('⚠️ 连接错误');
     };
 }
 
 function sendMsg(data) {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(data));
+    } else {
+        console.warn('⚠️ WebSocket 未打开，无法发送消息:', data.type);
+    }
 }
 
 // ============================================================
@@ -556,25 +562,41 @@ function sendMsg(data) {
 // ============================================================
 async function startAudioCapture() {
     try {
+        console.log('🎤 开始初始化音频...');
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        console.log('✅ 麦克风已获取');
         sourceNode = audioCtx.createMediaStreamSource(mediaStream);
 
         processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
         processorNode.onaudioprocess = (ev) => {
-            if (!isConnected) return;
+            // 检查连接状态
+            if (!isConnected) {
+                return;
+            }
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            
             const inputData = ev.inputBuffer.getChannelData(0);
             feedAudioData(myCardId || 'user1', inputData);
             const pcm = floatTo16BitPCM(inputData);
             const b64 = arrayBufferToBase64(pcm);
+            
+            // 每50次发送打印一次日志，避免刷屏
+            audioSendCount++;
+            if (audioSendCount % 50 === 0) {
+                console.log('🎤 发送音频数据，次数:', audioSendCount);
+            }
             sendMsg({ type: 'audio', audio: b64 });
         };
 
         sourceNode.connect(processorNode);
         processorNode.connect(audioCtx.destination);
+        console.log('✅ 音频采集已启动');
     } catch (err) {
         showToast('⚠️ 麦克风被拒绝');
-        console.error(err);
+        console.error('❌ 音频初始化失败:', err);
         updateConnBadge(false);
     }
 }
@@ -584,6 +606,7 @@ function stopAudioCapture() {
     if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
     if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
     if (audioCtx && audioCtx.state !== 'closed') { audioCtx.close(); audioCtx = null; }
+    console.log('🛑 音频采集已停止');
 }
 
 // ============================================================
