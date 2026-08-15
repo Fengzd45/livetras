@@ -486,7 +486,6 @@ function connect() {
         sendMsg({ type: 'set_region', region: regionSelect.value });
         sendMsg({ type: 'set_language', target_lang: lang });
 
-        // 启动音频采集（此时 isConnected 已为 true）
         startAudioCapture();
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     };
@@ -570,20 +569,14 @@ async function startAudioCapture() {
 
         processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
         processorNode.onaudioprocess = (ev) => {
-            // 检查连接状态
-            if (!isConnected) {
-                return;
-            }
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                return;
-            }
+            if (!isConnected) return;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
             
             const inputData = ev.inputBuffer.getChannelData(0);
             feedAudioData(myCardId || 'user1', inputData);
             const pcm = floatTo16BitPCM(inputData);
             const b64 = arrayBufferToBase64(pcm);
             
-            // 每50次发送打印一次日志，避免刷屏
             audioSendCount++;
             if (audioSendCount % 50 === 0) {
                 console.log('🎤 发送音频数据，次数:', audioSendCount);
@@ -610,13 +603,13 @@ function stopAudioCapture() {
 }
 
 // ============================================================
-// 音频工具
+// 音频工具（修正版）
 // ============================================================
 function floatTo16BitPCM(float32Array) {
     const pcm = new Int16Array(float32Array.length);
     for (let i = 0; i < float32Array.length; i++) {
         const s = Math.max(-1, Math.min(1, float32Array[i]));
-        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        pcm[i] = Math.round(s * 32767);
     }
     return pcm.buffer;
 }
@@ -624,7 +617,9 @@ function floatTo16BitPCM(float32Array) {
 function arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
     let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
     return btoa(binary);
 }
 
