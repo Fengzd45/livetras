@@ -194,6 +194,17 @@
     <span class="status">👤 <span class="count" id="onlineCount">0</span>/4</span>
     <div class="controls">
         <input type="text" id="myName" placeholder="输入你的姓名" value="冯忠德">
+        <select id="langSelect">
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+            <option value="es">Español</option>
+            <option value="ru">Русский</option>
+            <option value="auto">自动检测</option>
+        </select>
         <select id="regionSelect">
             <option value="cn">国内</option>
             <option value="intl">国际</option>
@@ -227,6 +238,7 @@ let waveformData = {};
 let speakingMap = {};
 let myCardId = 'user1';
 let audioSendCount = 0;
+let myLanguage = 'zh';  // 默认中文
 
 const cardGrid = document.getElementById('cardGrid');
 const actionBtn = document.getElementById('actionBtn');
@@ -234,19 +246,9 @@ const leaveBtn = document.getElementById('leaveBtn');
 const connBadge = document.getElementById('connBadge');
 const onlineCount = document.getElementById('onlineCount');
 const myNameInput = document.getElementById('myName');
+const langSelect = document.getElementById('langSelect');
 const regionSelect = document.getElementById('regionSelect');
 const toastEl = document.getElementById('toast');
-
-// ============================================================
-// 语言检测
-// ============================================================
-function detectLanguage(name) {
-    if (/[\u4e00-\u9fff]/.test(name)) return 'zh';
-    if (/[\u3040-\u30ff\u31f0-\u31ff]/.test(name)) return 'ja';
-    if (/[\uac00-\ud7af\u1100-\u11ff]/.test(name)) return 'ko';
-    if (/[\u0400-\u04ff]/.test(name)) return 'ru';
-    return 'en';
-}
 
 // ============================================================
 // 初始化卡片
@@ -463,6 +465,7 @@ function redrawAllCards(clients) {
 function connect() {
     const name = myNameInput.value.trim() || '我';
     clientId = name;
+    myLanguage = langSelect.value;  // 获取选择的语言
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/${ROOM_ID}/${encodeURIComponent(clientId)}`;
 
@@ -474,9 +477,8 @@ function connect() {
         console.log('✅ WebSocket 连接已打开');
         isConnected = true;
         updateConnBadge(true);
-        showToast(`✅ ${clientId} 已加入`);
+        showToast(`✅ ${clientId} 已加入 (语言: ${myLanguage})`);
 
-        const lang = detectLanguage(clientId);
         myCardId = 'user1';
         updateCardName('user1', clientId);
         updateCardState('user1', '🎤 在线', 'online');
@@ -484,7 +486,7 @@ function connect() {
         setCardEmpty('user1', false);
 
         sendMsg({ type: 'set_region', region: regionSelect.value });
-        sendMsg({ type: 'set_language', target_lang: lang });
+        sendMsg({ type: 'set_language', target_lang: myLanguage });
 
         startAudioCapture();
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -670,6 +672,15 @@ myNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(
 
 leaveBtn.addEventListener('click', () => { if (ws) ws.close(); });
 
+langSelect.addEventListener('change', () => {
+    if (isConnected) {
+        const lang = langSelect.value;
+        myLanguage = lang;
+        sendMsg({ type: 'set_language', target_lang: lang });
+        showToast(`🔄 语言切换为: ${lang}`);
+    }
+});
+
 regionSelect.addEventListener('change', () => {
     if (isConnected) sendMsg({ type: 'set_region', region: regionSelect.value });
 });
@@ -678,11 +689,9 @@ myNameInput.addEventListener('change', () => {
     if (isConnected) {
         const newName = myNameInput.value.trim() || '我';
         clientId = newName;
-        const lang = detectLanguage(newName);
         if (myCardId) {
             updateCardName(myCardId, newName);
-            sendMsg({ type: 'set_language', target_lang: lang });
-            showToast(`🔄 语言: ${lang}`);
+            showToast(`🔄 姓名更新为: ${newName}`);
         }
     }
 });
