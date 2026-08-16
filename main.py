@@ -43,13 +43,13 @@ LANG_MAP = {
 }
 
 rooms: Dict[str, Dict] = {}
-asr_queues: Dict[str, asyncio.Queue] = {}
 
 # ---------- ASR 回调 ----------
 class StreamingCallback(RecognitionCallback):
-    def __init__(self, client_id: str, queue: asyncio.Queue):
+    def __init__(self, client_id: str, loop: asyncio.AbstractEventLoop, room_id: str):
         self.client_id = client_id
-        self.queue = queue
+        self.loop = loop
+        self.room_id = room_id
         self.is_broken = False
 
     def on_open(self):
@@ -91,10 +91,11 @@ class StreamingCallback(RecognitionCallback):
             return
         if is_end:
             logger.info(f"ASR 断句完成 [{self.client_id}]: '{text}'")
-            try:
-                self.queue.put_nowait(text)
-            except asyncio.QueueFull:
-                logger.warning(f"队列已满，丢弃: {text}")
+            # 使用线程安全的方式调用异步函数
+            asyncio.run_coroutine_threadsafe(
+                handle_asr_result(self.client_id, text, self.room_id),
+                self.loop
+            )
 
 # ---------- 翻译 ----------
 def translate_text(text: str, target_lang: str) -> str:
@@ -148,13 +149,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     if room_id not in rooms:
         rooms[room_id] = {"clients": {}, "languages": {}}
     rooms[room_id]["clients"][client_id] = websocket
+    await broadcast_room_status(room_id)
 
-    # 创建队列
-    queue = asyncio.Queue(maxsize=10)
-    asr_queues[client_id] = queue
+    # 获取当前事件循环
+    loop = asyncio.get_running_loop()
 
     # 创建 ASR 会话
-    callback = StreamingCallback(client_id, queue)
+    callback = StreamingCallback(client_id, loop, room_id)
+    recognition = None
     try:
         recognition = Recognition(
             model=ASR_MODEL,
@@ -163,30 +165,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             callback=callback
         )
         recognition.start()
-        asr_queues[client_id] = queue
         logger.info(f"✅ ASR 会话已创建: {client_id}")
         await websocket.send_text(json.dumps({"type": "asr_ready", "msg": "语音识别已就绪"}))
     except Exception as e:
         logger.error(f"ASR 启动失败: {e}")
         await websocket.send_text(json.dumps({"type": "asr_error", "msg": f"ASR 启动失败: {e}"}))
-        recognition = None
-
-    # 后台任务：从队列取识别结果
-    async def process_queue():
-        while True:
-            try:
-                text = await queue.get()
-                if text is None:
-                    break
-                # 在 WebSocket 还存活时处理
-                if room_id in rooms and client_id in rooms[room_id]["clients"]:
-                    await handle_asr_result(client_id, text, room_id)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"处理队列失败: {e}")
-
-    queue_task = asyncio.create_task(process_queue())
 
     try:
         while True:
@@ -214,13 +197,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
     finally:
-        # 清理
-        queue_task.cancel()
-        try:
-            await queue_task
-        except asyncio.CancelledError:
-            pass
-
         if recognition:
             try:
                 recognition.stop()
@@ -232,25 +208,30 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             rooms[room_id]["languages"].pop(client_id, None)
             if not rooms[room_id]["clients"]:
                 del rooms[room_id]
-
-        asr_queues.pop(client_id, None)
         await broadcast_room_status(room_id)
 
 # ---------- 处理识别结果 ----------
 async def handle_asr_result(client_id: str, text: str, room_id: str):
     logger.info(f"📝 处理识别结果: {client_id} -> '{text}'")
 
+    # 检查房间和客户端是否存在
+    if room_id not in rooms:
+        logger.warning(f"房间 {room_id} 不存在")
+        return
+    if client_id not in rooms[room_id]["clients"]:
+        logger.warning(f"客户端 {client_id} 不在房间中")
+        return
+
     # 发送给说话者自己
-    if room_id in rooms and client_id in rooms[room_id]["clients"]:
-        speaker_ws = rooms[room_id]["clients"][client_id]
-        try:
-            await speaker_ws.send_text(json.dumps({
-                "type": "asr_result",
-                "text": text
-            }))
-            logger.info(f"✅ 已发送 asr_result 给 {client_id}")
-        except Exception as e:
-            logger.error(f"发送失败: {e}")
+    speaker_ws = rooms[room_id]["clients"][client_id]
+    try:
+        await speaker_ws.send_text(json.dumps({
+            "type": "asr_result",
+            "text": text
+        }))
+        logger.info(f"✅ 已发送 asr_result 给 {client_id}")
+    except Exception as e:
+        logger.error(f"发送给说话者失败: {e}")
 
     # 翻译给其他人
     target_langs = {
@@ -258,10 +239,9 @@ async def handle_asr_result(client_id: str, text: str, room_id: str):
         if cid != client_id
     }
     if target_langs:
-        tasks = []
+        logger.info(f"🔄 翻译给 {len(target_langs)} 个目标")
         for target_cid, target_lang in target_langs.items():
-            tasks.append(translate_and_synthesize(text, target_lang, target_cid, room_id, client_id))
-        await asyncio.gather(*tasks)
+            await translate_and_synthesize(text, target_lang, target_cid, room_id, client_id)
 
 # ---------- 翻译 + TTS ----------
 async def translate_and_synthesize(text: str, target_lang: str,
