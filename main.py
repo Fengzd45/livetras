@@ -89,8 +89,9 @@ class StreamingCallback(RecognitionCallback):
             is_end = bool(getattr(sentence, "sentence_end", False))
         if not text:
             return
-        if is_end:
-            logger.info(f"ASR 断句完成 [{self.client_id}]: '{text}'")
+        # 只要是识别结果就推送（不等待 sentence_end，减少延迟）
+        if text:
+            logger.info(f"ASR 识别 [{self.client_id}]: '{text}' (is_end={is_end})")
             asyncio.run_coroutine_threadsafe(
                 handle_asr_result(self.client_id, text, self.room_id),
                 self.loop
@@ -146,13 +147,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     logger.info(f"✅ 客户端 {client_id} 加入房间 {room_id}")
 
     if room_id not in rooms:
-        rooms[room_id] = {"clients": {}, "languages": {}, "pending_results": []}
+        rooms[room_id] = {"clients": {}, "languages": {}}
     rooms[room_id]["clients"][client_id] = websocket
     await broadcast_room_status(room_id)
 
     loop = asyncio.get_running_loop()
 
-    # 创建 ASR 会话
     callback = StreamingCallback(client_id, loop, room_id)
     recognition = None
     try:
@@ -160,7 +160,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             model=ASR_MODEL,
             format="pcm",
             sample_rate=16000,
-            callback=callback
+            callback=callback,
+            # === 延迟优化参数 ===
+            enable_intermediate_result=True,  # 启用中间结果
+            # vad_threshold=500,               # VAD 静音阈值（毫秒），模型可能不支持，保留注释
         )
         recognition.start()
         logger.info(f"✅ ASR 会话已创建: {client_id}")
@@ -195,23 +198,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
     finally:
-        # 关闭 ASR 会话
         if recognition:
             try:
                 recognition.stop()
             except Exception as e:
                 logger.error(f"关闭 ASR 失败: {e}")
 
-        # 标记客户端为离线，但不立即删除房间（保留 5 秒等待 ASR 结果）
         if room_id in rooms:
             rooms[room_id]["clients"].pop(client_id, None)
-            # 如果房间为空，5 秒后删除
             if not rooms[room_id]["clients"]:
-                logger.info(f"房间 {room_id} 已空，5 秒后删除")
                 await asyncio.sleep(5)
                 if room_id in rooms and not rooms[room_id]["clients"]:
                     del rooms[room_id]
-                    logger.info(f"房间 {room_id} 已删除")
             else:
                 await broadcast_room_status(room_id)
 
@@ -219,14 +217,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 async def handle_asr_result(client_id: str, text: str, room_id: str):
     logger.info(f"📝 处理识别结果: {client_id} -> '{text}'")
 
-    # 检查房间是否存在（可能已被删除）
     if room_id not in rooms:
-        logger.warning(f"房间 {room_id} 不存在，结果被丢弃")
+        logger.warning(f"房间 {room_id} 不存在")
         return
 
-    # 检查客户端是否还在房间中
     if client_id not in rooms[room_id]["clients"]:
-        logger.warning(f"客户端 {client_id} 已离开，结果被丢弃")
+        logger.warning(f"客户端 {client_id} 已离开")
         return
 
     # 发送给说话者自己
@@ -238,7 +234,7 @@ async def handle_asr_result(client_id: str, text: str, room_id: str):
         }))
         logger.info(f"✅ 已发送 asr_result 给 {client_id}")
     except Exception as e:
-        logger.error(f"发送给说话者失败: {e}")
+        logger.error(f"发送失败: {e}")
 
     # 翻译给其他人
     target_langs = {
@@ -246,7 +242,6 @@ async def handle_asr_result(client_id: str, text: str, room_id: str):
         if cid != client_id
     }
     if target_langs:
-        logger.info(f"🔄 翻译给 {len(target_langs)} 个目标")
         for target_cid, target_lang in target_langs.items():
             await translate_and_synthesize(text, target_lang, target_cid, room_id, client_id)
 
