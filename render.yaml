@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: my-translator
+    name: four-talk-translator
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: SILICONFLOW_API_KEY
+      - key: DASHSCOPE_API_KEY
         sync: false
