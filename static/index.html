@@ -203,11 +203,6 @@
             <option value="de">Deutsch</option>
             <option value="es">Español</option>
             <option value="ru">Русский</option>
-            <option value="auto">自动检测</option>
-        </select>
-        <select id="regionSelect">
-            <option value="cn">国内</option>
-            <option value="intl">国际</option>
         </select>
         <span class="badge offline" id="connBadge">● 离线</span>
         <button id="actionBtn">加入</button>
@@ -238,7 +233,7 @@ let waveformData = {};
 let speakingMap = {};
 let myCardId = 'user1';
 let audioSendCount = 0;
-let myLanguage = 'zh';  // 默认中文
+let myLanguage = 'zh';
 
 const cardGrid = document.getElementById('cardGrid');
 const actionBtn = document.getElementById('actionBtn');
@@ -247,7 +242,6 @@ const connBadge = document.getElementById('connBadge');
 const onlineCount = document.getElementById('onlineCount');
 const myNameInput = document.getElementById('myName');
 const langSelect = document.getElementById('langSelect');
-const regionSelect = document.getElementById('regionSelect');
 const toastEl = document.getElementById('toast');
 
 // ============================================================
@@ -465,7 +459,7 @@ function redrawAllCards(clients) {
 function connect() {
     const name = myNameInput.value.trim() || '我';
     clientId = name;
-    myLanguage = langSelect.value;  // 获取选择的语言
+    myLanguage = langSelect.value;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/${ROOM_ID}/${encodeURIComponent(clientId)}`;
 
@@ -485,7 +479,6 @@ function connect() {
         document.getElementById(`card-user1`).className = 'card active';
         setCardEmpty('user1', false);
 
-        sendMsg({ type: 'set_region', region: regionSelect.value });
         sendMsg({ type: 'set_language', target_lang: myLanguage });
 
         startAudioCapture();
@@ -496,6 +489,7 @@ function connect() {
         try {
             const data = JSON.parse(e.data);
             console.log('收到消息:', data);
+            
             if (data.type === 'room_status') {
                 const clients = data.clients || [];
                 redrawAllCards(clients);
@@ -511,17 +505,21 @@ function connect() {
                 }
             } else if (data.type === 'translation') {
                 const text = data.text || '';
-                if (clientId && text) {
-                    appendMessage(myCardId || 'user1', text);
+                const from = data.from || '对方';
+                if (text) {
+                    appendMessage(myCardId || 'user1', `📢 ${from}: ${text}`);
                 }
                 if (data.audio) playAudio(data.audio);
             } else if (data.type === 'asr_result') {
                 const text = data.text || '';
                 if (text && myCardId) {
                     appendMessage(myCardId, '🎤 ' + text);
+                    console.log('✅ ASR 结果显示在卡片上:', text);
                 }
-            } else if (data.type === 'region_status') {
-                showToast(`🌐 ${data.msg}`);
+            } else if (data.type === 'asr_ready') {
+                showToast('✅ ' + data.msg);
+            } else if (data.type === 'asr_error') {
+                showToast('⚠️ ' + data.msg);
             }
         } catch (err) {
             console.error('解析消息失败:', err);
@@ -537,10 +535,11 @@ function connect() {
         document.getElementById(`card-${myCardId || 'user1'}`).className = 'card';
         resetWaveform(myCardId || 'user1');
         showToast('❌ 已断开');
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => {
-            if (!isConnected) { showToast('🔄 重连...'); connect(); }
-        }, 5000);
+        // 禁用自动重连（让用户手动点击"加入"重新连接）
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
     };
 
     ws.onerror = () => {
@@ -559,7 +558,7 @@ function sendMsg(data) {
 }
 
 // ============================================================
-// 音频采集（修正版：强制 16000Hz + 音量检测）
+// 音频采集
 // ============================================================
 async function startAudioCapture() {
     try {
@@ -587,13 +586,12 @@ async function startAudioCapture() {
             
             const inputData = ev.inputBuffer.getChannelData(0);
             
-            // 检测音量，静音时跳过
             let sum = 0;
             for (let i = 0; i < inputData.length; i++) {
                 sum += inputData[i] * inputData[i];
             }
             const rms = Math.sqrt(sum / inputData.length);
-            if (rms < 0.005) return; // 静音跳过
+            if (rms < 0.005) return;
             
             feedAudioData(myCardId || 'user1', inputData);
             const pcm = floatTo16BitPCM(inputData);
@@ -670,7 +668,17 @@ function playAudio(b64) {
 actionBtn.addEventListener('click', connect);
 myNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
 
-leaveBtn.addEventListener('click', () => { if (ws) ws.close(); });
+leaveBtn.addEventListener('click', () => {
+    // 显式停止音频和关闭连接
+    stopAudioCapture();
+    isConnected = false;
+    if (ws) ws.close();
+    // 重置卡片状态
+    CARD_IDS.forEach(id => resetWaveform(id));
+    updateConnBadge(false);
+    updateCardState(myCardId || 'user1', '已离开', 'waiting');
+    showToast('👋 已离开房间');
+});
 
 langSelect.addEventListener('change', () => {
     if (isConnected) {
@@ -679,10 +687,6 @@ langSelect.addEventListener('change', () => {
         sendMsg({ type: 'set_language', target_lang: lang });
         showToast(`🔄 语言切换为: ${lang}`);
     }
-});
-
-regionSelect.addEventListener('change', () => {
-    if (isConnected) sendMsg({ type: 'set_region', region: regionSelect.value });
 });
 
 myNameInput.addEventListener('change', () => {
@@ -700,7 +704,7 @@ myNameInput.addEventListener('change', () => {
 // 启动
 // ============================================================
 startWaveformLoop();
-console.log('🎙️ 四人会谈已加载 (最终版)');
+console.log('🎙️ 四人会谈已加载 (阿里百炼版)');
 </script>
 </body>
 </html>
