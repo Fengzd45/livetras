@@ -332,6 +332,25 @@ function updateOnlineCount(count) {
 }
 
 // ============================================================
+// 重置所有卡片（离开时使用）
+// ============================================================
+function resetAllCards() {
+    CARD_IDS.forEach(id => {
+        updateCardName(id, id);
+        updateCardState(id, '⏳ 等待', 'waiting');
+        document.getElementById(`card-${id}`).className = 'card';
+        setCardEmpty(id, true);
+        resetWaveform(id);
+        // 清空消息
+        const el = document.getElementById(`scroll-${id}`);
+        if (el) {
+            el.innerHTML = '<div class="empty">等待加入...</div>';
+        }
+    });
+    updateOnlineCount(0);
+}
+
+// ============================================================
 // 波形图
 // ============================================================
 function updateWaveform(id, amplitude) {
@@ -434,6 +453,11 @@ function redrawAllCards(clients) {
         card.className = 'card';
         setCardEmpty(id, true);
         resetWaveform(id);
+        // 清空消息
+        const el = document.getElementById(`scroll-${id}`);
+        if (el) {
+            el.innerHTML = '<div class="empty">等待加入...</div>';
+        }
     });
 
     const onlineUsers = clients || [];
@@ -531,11 +555,12 @@ function connect() {
         isConnected = false;
         updateConnBadge(false);
         stopAudioCapture();
-        updateCardState(myCardId || 'user1', '离线', 'waiting');
-        document.getElementById(`card-${myCardId || 'user1'}`).className = 'card';
-        resetWaveform(myCardId || 'user1');
+        // 重置所有卡片
+        resetAllCards();
+        // 重置自己的卡片
+        clientId = null;
+        myCardId = 'user1';
         showToast('❌ 已断开');
-        // 禁用自动重连（让用户手动点击"加入"重新连接）
         if (reconnectTimer) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
@@ -669,14 +694,23 @@ actionBtn.addEventListener('click', connect);
 myNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
 
 leaveBtn.addEventListener('click', () => {
-    // 显式停止音频和关闭连接
+    // 1. 停止音频
     stopAudioCapture();
+    
+    // 2. 关闭 WebSocket
+    if (ws) {
+        ws.close();
+    }
+    
+    // 3. 手动重置所有状态（不依赖服务端广播）
     isConnected = false;
-    if (ws) ws.close();
-    // 重置卡片状态
-    CARD_IDS.forEach(id => resetWaveform(id));
     updateConnBadge(false);
-    updateCardState(myCardId || 'user1', '已离开', 'waiting');
+    resetAllCards();
+    
+    // 4. 重置自己的变量
+    clientId = null;
+    myCardId = 'user1';
+    
     showToast('👋 已离开房间');
 });
 
