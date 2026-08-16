@@ -9,6 +9,7 @@ from fastapi import FastAPI, WebSocketDisconnect, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
+from collections import deque
 
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback
@@ -45,17 +46,20 @@ LANG_MAP = {
 
 rooms: Dict[str, Dict] = {}
 
+# ---------- ASR 结果队列（线程安全） ----------
+asr_result_queues: Dict[str, asyncio.Queue] = {}
+
 # ---------- ASR 会话管理 ----------
 class ASRSessionManager:
     def __init__(self):
         self.sessions: Dict[str, dict] = {}
     
-    def create_session(self, client_id: str, on_result, on_error):
+    def create_session(self, client_id: str, result_queue: asyncio.Queue, on_error):
         if not DASHSCOPE_API_KEY:
             on_error("DASHSCOPE_API_KEY 未设置")
             return None
         
-        callback = _StreamingCallback(client_id, on_result, on_error)
+        callback = _StreamingCallback(client_id, result_queue, on_error)
         try:
             recognition = Recognition(
                 model=ASR_MODEL,
@@ -95,9 +99,9 @@ class ASRSessionManager:
             logger.info(f"ASR 会话已关闭: {client_id}")
 
 class _StreamingCallback(RecognitionCallback):
-    def __init__(self, client_id, on_result, on_error):
+    def __init__(self, client_id, result_queue, on_error):
         self.client_id = client_id
-        self.on_result = on_result
+        self.result_queue = result_queue
         self.on_error = on_error
         self.is_broken = False
     
@@ -147,7 +151,11 @@ class _StreamingCallback(RecognitionCallback):
             return
         if is_end:
             logger.info(f"ASR 断句完成 [{self.client_id}]: '{text}'")
-            self.on_result(self.client_id, text)
+            # 放入队列（线程安全）
+            try:
+                self.result_queue.put_nowait(text)
+            except asyncio.QueueFull:
+                logger.warning(f"队列已满，丢弃识别结果: {text}")
 
 asr_manager = ASRSessionManager()
 
@@ -213,28 +221,34 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     rooms[room_id]["clients"][client_id] = websocket
     await broadcast_room_status(room_id)
 
-    # 获取事件循环（用于线程安全的异步调用）
-    loop = asyncio.get_running_loop()
+    # 创建 ASR 结果队列
+    result_queue = asyncio.Queue(maxsize=10)
+    asr_result_queues[client_id] = result_queue
 
-    def on_result(cid, text):
-        """ASR 识别结果回调（在 SDK 的线程中执行）"""
-        asyncio.run_coroutine_threadsafe(
-            handle_asr_result(cid, text, room_id),
-            loop
-        )
-    
     def on_error(msg):
-        """ASR 错误回调（在 SDK 的线程中执行）"""
-        asyncio.run_coroutine_threadsafe(
-            websocket.send_text(json.dumps({"type": "asr_error", "msg": msg})),
-            loop
-        )
-    
-    callback = asr_manager.create_session(client_id, on_result, on_error)
+        """ASR 错误回调"""
+        asyncio.create_task(websocket.send_text(json.dumps({"type": "asr_error", "msg": msg})))
+
+    callback = asr_manager.create_session(client_id, result_queue, on_error)
     if callback:
         await websocket.send_text(json.dumps({"type": "asr_ready", "msg": "语音识别已就绪"}))
     else:
         await websocket.send_text(json.dumps({"type": "asr_error", "msg": "语音识别启动失败"}))
+
+    # 启动后台任务处理 ASR 结果
+    async def process_asr_results():
+        while True:
+            try:
+                text = await result_queue.get()
+                if text is None:  # 停止信号
+                    break
+                await handle_asr_result(client_id, text, room_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"处理 ASR 结果失败: {e}")
+
+    asr_task = asyncio.create_task(process_asr_results())
 
     try:
         while True:
@@ -258,19 +272,28 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
     finally:
+        # 停止 ASR 结果处理任务
+        asr_task.cancel()
+        try:
+            await asr_task
+        except asyncio.CancelledError:
+            pass
+        
+        # 清理
         if room_id in rooms:
             rooms[room_id]["clients"].pop(client_id, None)
             rooms[room_id]["languages"].pop(client_id, None)
             if not rooms[room_id]["clients"]:
                 del rooms[room_id]
         asr_manager.close_session(client_id)
+        asr_result_queues.pop(client_id, None)
         await broadcast_room_status(room_id)
 
 async def handle_asr_result(client_id: str, text: str, room_id: str):
     """处理 ASR 识别结果"""
     logger.info(f"📝 处理识别结果: {client_id} -> '{text}'")
     
-    # 1. 发送给说话者自己（前端会在卡片上显示）
+    # 1. 发送给说话者自己
     if room_id in rooms and client_id in rooms[room_id]["clients"]:
         speaker_ws = rooms[room_id]["clients"][client_id]
         await speaker_ws.send_text(json.dumps({
@@ -285,7 +308,7 @@ async def handle_asr_result(client_id: str, text: str, room_id: str):
         if cid != client_id
     }
     if target_langs:
-        logger.info(f"🔄 翻译给 {len(target_langs)} 个目标: {target_langs}")
+        logger.info(f"🔄 翻译给 {len(target_langs)} 个目标")
         tasks = []
         for target_cid, target_lang in target_langs.items():
             tasks.append(translate_and_synthesize(text, target_lang, target_cid, room_id, client_id))
