@@ -13,21 +13,20 @@ from contextlib import asynccontextmanager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- 配置（改用阿里百炼） ---
+# --- 配置（阿里百炼） ---
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
 if not DASHSCOPE_API_KEY:
     logger.warning("⚠️ 环境变量 DASHSCOPE_API_KEY 未设置！")
 
-# 阿里百炼 API 地址
-DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/api/v1/services"
-ASR_URL = f"{DASHSCOPE_BASE}/audio/asr/transcription"   # 非流式识别
-TRANSLATE_URL = f"{DASHSCOPE_BASE}/machine-translation/translation"
-TTS_URL = f"{DASHSCOPE_BASE}/audio/tts/speech"
+# 阿里百炼 API 地址（非流式）
+ASR_URL = "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription"
+TRANSLATE_URL = "https://dashscope.aliyuncs.com/api/v1/services/machine-translation/translation"
+TTS_URL = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/speech"
 
-ASR_MODEL = "fun-asr"              # 可用 fun-asr 或 qwen-asr
+ASR_MODEL = "fun-asr"                # 或 qwen-asr
 TRANSLATE_MODEL = "qwen-mt-turbo"
 TTS_MODEL = "cosyvoice-v2"
-TTS_VOICE = "default"              # 默认音色
+TTS_VOICE = "default"
 
 # 语言映射（前端 -> 翻译目标代码）
 LANG_MAP = {
@@ -45,7 +44,7 @@ rooms: Dict[str, Dict] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 同声传译服务器启动（阿里百炼版：ASR+翻译+TTS）")
+    logger.info("🚀 同声传译服务器启动（阿里百炼版）")
     yield
     logger.info("🛑 服务器关闭")
 
@@ -110,16 +109,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 del rooms[room_id]
         await broadcast_room_status(room_id)
 
-# ----- 使用阿里百炼 ASR（非流式 HTTP） -----
+# ----- 使用阿里百炼 ASR（非流式 HTTP，base64）-----
 def recognize_speech(wav_data: bytes) -> str:
-    """使用阿里百炼 ASR 识别音频（非流式）"""
+    """使用阿里百炼 ASR 识别音频"""
     if not DASHSCOPE_API_KEY:
-        logger.error("DASHSCOPE_API_KEY 未设置，无法识别")
+        logger.error("DASHSCOPE_API_KEY 未设置")
         return ""
-    
-    # 将 WAV 数据转为 base64
+
     audio_b64 = base64.b64encode(wav_data).decode('utf-8')
-    
     headers = {
         "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
         "Content-Type": "application/json"
@@ -136,28 +133,29 @@ def recognize_speech(wav_data: bytes) -> str:
             "enable_vad": True
         }
     }
+
     try:
         response = requests.post(ASR_URL, headers=headers, json=payload, timeout=60)
+        logger.info(f"ASR 响应状态码: {response.status_code}")
         if response.status_code == 200:
             result = response.json()
-            # 不同模型返回结构略有差异，一般取 output.text
+            # 打印完整响应用于调试
+            logger.info(f"ASR 响应内容: {json.dumps(result, ensure_ascii=False)}")
             text = result.get("output", {}).get("text", "").strip()
             if text:
-                logger.info(f"阿里百炼 ASR 识别结果: {text}")
+                logger.info(f"✅ ASR 识别结果: {text}")
                 return text
             else:
                 logger.warning("ASR 返回空文本")
                 return ""
         else:
-            logger.error(f"ASR API 失败: {response.status_code} {response.text}")
+            logger.error(f"ASR API 失败: {response.status_code} - {response.text}")
             return ""
     except Exception as e:
-        logger.error(f"ASR 异常: {e}")
+        logger.error(f"ASR 异常: {e}", exc_info=True)
         return ""
 
-# process_audio_only 和 process_audio_and_translate 保持不变（它们调用 recognize_speech）
-# 但 translate_and_synthesize 需要改成阿里百炼翻译 + TTS
-
+# ----- 以下三个函数保持原逻辑（仅调用 recognize_speech）-----
 async def process_audio_only(audio_b64: str, room_id: str, speaker_id: str):
     try:
         pcm_bytes = base64.b64decode(audio_b64)
@@ -177,7 +175,7 @@ async def process_audio_only(audio_b64: str, room_id: str, speaker_id: str):
             logger.info(f"✅ 已向 {speaker_id} 发送识别结果: {original_text}")
 
     except Exception as e:
-        logger.error(f"仅识别处理失败: {e}")
+        logger.error(f"仅识别处理失败: {e}", exc_info=True)
 
 async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, str],
                                       room_id: str, speaker_id: str):
@@ -208,20 +206,20 @@ async def process_audio_and_translate(audio_b64: str, target_langs: Dict[str, st
         await asyncio.gather(*tasks)
 
     except Exception as e:
-        logger.error(f"处理音频失败: {e}")
+        logger.error(f"处理音频失败: {e}", exc_info=True)
 
-# ---------- 新翻译 + TTS（阿里百炼） ----------
+# ----- 翻译和 TTS 改用阿里百炼 -----
 async def translate_and_synthesize(text: str, target_lang: str,
                                    target_client_id: str, room_id: str,
                                    speaker_id: str):
     try:
         # 1. 翻译
         target = LANG_MAP.get(target_lang, "en")
-        translate_headers = {
+        trans_headers = {
             "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
             "Content-Type": "application/json"
         }
-        translate_payload = {
+        trans_payload = {
             "model": TRANSLATE_MODEL,
             "input": {
                 "text": text,
@@ -229,7 +227,7 @@ async def translate_and_synthesize(text: str, target_lang: str,
                 "target_lang": target
             }
         }
-        trans_resp = requests.post(TRANSLATE_URL, headers=translate_headers, json=translate_payload, timeout=30)
+        trans_resp = requests.post(TRANSLATE_URL, headers=trans_headers, json=trans_payload, timeout=30)
         if trans_resp.status_code != 200:
             logger.error(f"翻译失败: {trans_resp.text}")
             return
@@ -255,7 +253,6 @@ async def translate_and_synthesize(text: str, target_lang: str,
         audio_bytes = tts_resp.content
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
 
-        # 3. 发送给目标客户端
         if room_id in rooms and target_client_id in rooms[room_id]["clients"]:
             target_ws = rooms[room_id]["clients"][target_client_id]
             response = {
@@ -268,9 +265,9 @@ async def translate_and_synthesize(text: str, target_lang: str,
             await target_ws.send_text(json.dumps(response))
 
     except Exception as e:
-        logger.error(f"翻译合成失败 (目标 {target_lang}): {e}")
+        logger.error(f"翻译合成失败 (目标 {target_lang}): {e}", exc_info=True)
 
-# ---------- build_wav_header 保持不变 ----------
+# ----- build_wav_header 保持不变 -----
 def build_wav_header(data_len: int, sample_rate: int = 16000,
                      channels: int = 1, bits_per_sample: int = 16) -> bytes:
     byte_rate = sample_rate * channels * bits_per_sample // 8
@@ -291,7 +288,7 @@ def build_wav_header(data_len: int, sample_rate: int = 16000,
     header.extend(data_len.to_bytes(4, 'little'))
     return bytes(header)
 
-# ---------- broadcast_room_status 保持不变 ----------
+# ----- broadcast_room_status 保持不变 -----
 async def broadcast_room_status(room_id: str):
     if room_id not in rooms:
         return
