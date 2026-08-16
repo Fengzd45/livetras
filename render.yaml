@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: four-talk-translator
+    name: livetras
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
