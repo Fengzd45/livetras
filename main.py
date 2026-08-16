@@ -91,7 +91,6 @@ class StreamingCallback(RecognitionCallback):
             return
         if is_end:
             logger.info(f"ASR 断句完成 [{self.client_id}]: '{text}'")
-            # 使用线程安全的方式调用异步函数
             asyncio.run_coroutine_threadsafe(
                 handle_asr_result(self.client_id, text, self.room_id),
                 self.loop
@@ -147,11 +146,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     logger.info(f"✅ 客户端 {client_id} 加入房间 {room_id}")
 
     if room_id not in rooms:
-        rooms[room_id] = {"clients": {}, "languages": {}}
+        rooms[room_id] = {"clients": {}, "languages": {}, "pending_results": []}
     rooms[room_id]["clients"][client_id] = websocket
     await broadcast_room_status(room_id)
 
-    # 获取当前事件循环
     loop = asyncio.get_running_loop()
 
     # 创建 ASR 会话
@@ -197,29 +195,38 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
     finally:
+        # 关闭 ASR 会话
         if recognition:
             try:
                 recognition.stop()
             except Exception as e:
                 logger.error(f"关闭 ASR 失败: {e}")
 
+        # 标记客户端为离线，但不立即删除房间（保留 5 秒等待 ASR 结果）
         if room_id in rooms:
             rooms[room_id]["clients"].pop(client_id, None)
-            rooms[room_id]["languages"].pop(client_id, None)
+            # 如果房间为空，5 秒后删除
             if not rooms[room_id]["clients"]:
-                del rooms[room_id]
-        await broadcast_room_status(room_id)
+                logger.info(f"房间 {room_id} 已空，5 秒后删除")
+                await asyncio.sleep(5)
+                if room_id in rooms and not rooms[room_id]["clients"]:
+                    del rooms[room_id]
+                    logger.info(f"房间 {room_id} 已删除")
+            else:
+                await broadcast_room_status(room_id)
 
 # ---------- 处理识别结果 ----------
 async def handle_asr_result(client_id: str, text: str, room_id: str):
     logger.info(f"📝 处理识别结果: {client_id} -> '{text}'")
 
-    # 检查房间和客户端是否存在
+    # 检查房间是否存在（可能已被删除）
     if room_id not in rooms:
-        logger.warning(f"房间 {room_id} 不存在")
+        logger.warning(f"房间 {room_id} 不存在，结果被丢弃")
         return
+
+    # 检查客户端是否还在房间中
     if client_id not in rooms[room_id]["clients"]:
-        logger.warning(f"客户端 {client_id} 不在房间中")
+        logger.warning(f"客户端 {client_id} 已离开，结果被丢弃")
         return
 
     # 发送给说话者自己
