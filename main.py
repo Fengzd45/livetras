@@ -10,7 +10,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 
-# 阿里百炼 SDK
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback
 from dashscope.audio.tts_v2 import SpeechSynthesizer
@@ -27,11 +26,9 @@ if not DASHSCOPE_API_KEY:
 
 ASR_MODEL = "fun-asr-realtime"
 
-# 翻译 API
 TRANSLATE_URL = "https://dashscope.aliyuncs.com/api/v1/services/machine-translation/translation"
 TRANSLATE_MODEL = "qwen-mt-turbo"
 
-# TTS 配置
 TTS_MODEL = "cosyvoice-v2"
 TTS_VOICE = "longxiaochun_v2"
 
@@ -218,13 +215,20 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     rooms[room_id]["clients"][client_id] = websocket
     await broadcast_room_status(room_id)
 
+    # 获取当前事件循环（用于线程安全的异步调用）
+    loop = asyncio.get_running_loop()
+
     def on_result(cid, text):
-        asyncio.create_task(handle_asr_result(cid, text, room_id))
+        asyncio.run_coroutine_threadsafe(
+            handle_asr_result(cid, text, room_id),
+            loop
+        )
     
     def on_error(msg):
-        asyncio.create_task(websocket.send_text(json.dumps({
-            "type": "asr_error", "msg": msg
-        })))
+        asyncio.run_coroutine_threadsafe(
+            websocket.send_text(json.dumps({"type": "asr_error", "msg": msg})),
+            loop
+        )
     
     callback = asr_manager.create_session(client_id, on_result, on_error)
     if callback:
