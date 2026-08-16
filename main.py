@@ -9,7 +9,6 @@ from fastapi import FastAPI, WebSocketDisconnect, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
-from collections import deque
 
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback
@@ -18,7 +17,6 @@ from dashscope.audio.tts_v2 import SpeechSynthesizer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- 配置 ----------
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
 dashscope.api_key = DASHSCOPE_API_KEY
 
@@ -45,87 +43,29 @@ LANG_MAP = {
 }
 
 rooms: Dict[str, Dict] = {}
+asr_queues: Dict[str, asyncio.Queue] = {}
 
-# ---------- ASR 结果队列（线程安全） ----------
-asr_result_queues: Dict[str, asyncio.Queue] = {}
-
-# ---------- ASR 会话管理 ----------
-class ASRSessionManager:
-    def __init__(self):
-        self.sessions: Dict[str, dict] = {}
-    
-    def create_session(self, client_id: str, result_queue: asyncio.Queue, on_error):
-        if not DASHSCOPE_API_KEY:
-            on_error("DASHSCOPE_API_KEY 未设置")
-            return None
-        
-        callback = _StreamingCallback(client_id, result_queue, on_error)
-        try:
-            recognition = Recognition(
-                model=ASR_MODEL,
-                format="pcm",
-                sample_rate=16000,
-                callback=callback
-            )
-            recognition.start()
-            self.sessions[client_id] = {
-                "recognition": recognition,
-                "callback": callback
-            }
-            logger.info(f"✅ ASR 会话已创建: {client_id}")
-            return callback
-        except Exception as e:
-            logger.error(f"ASR 启动失败: {e}")
-            on_error(f"ASR 启动失败: {str(e)}")
-            return None
-    
-    def send_audio(self, client_id: str, pcm_bytes: bytes):
-        session = self.sessions.get(client_id)
-        if not session:
-            return
-        try:
-            session["recognition"].send_audio_frame(pcm_bytes)
-        except Exception as e:
-            logger.error(f"发送音频失败: {e}")
-            session["callback"].is_broken = True
-    
-    def close_session(self, client_id: str):
-        session = self.sessions.pop(client_id, None)
-        if session:
-            try:
-                session["recognition"].stop()
-            except Exception as e:
-                logger.error(f"关闭 ASR 会话失败: {e}")
-            logger.info(f"ASR 会话已关闭: {client_id}")
-
-class _StreamingCallback(RecognitionCallback):
-    def __init__(self, client_id, result_queue, on_error):
+# ---------- ASR 回调 ----------
+class StreamingCallback(RecognitionCallback):
+    def __init__(self, client_id: str, queue: asyncio.Queue):
         self.client_id = client_id
-        self.result_queue = result_queue
-        self.on_error = on_error
+        self.queue = queue
         self.is_broken = False
-    
+
     def on_open(self):
         logger.info(f"ASR 流式会话已建立: {self.client_id}")
-    
+
     def on_close(self):
         self.is_broken = True
         logger.info(f"ASR 流式会话已关闭: {self.client_id}")
-    
+
     def on_complete(self):
         logger.info(f"ASR 流式会话正常结束: {self.client_id}")
-    
+
     def on_error(self, result):
         self.is_broken = True
-        try:
-            status_code = getattr(result, "status_code", None)
-            message = getattr(result, "message", None)
-            logger.error(f"ASR 错误: status_code={status_code}, message={message}")
-            self.on_error(f"ASR 错误: {message}")
-        except Exception:
-            logger.error("ASR 错误（无法解析详细信息）")
-            self.on_error("ASR 发生错误")
-    
+        logger.error(f"ASR 错误: {result}")
+
     def on_event(self, result):
         try:
             sentence = result.get_sentence()
@@ -139,7 +79,7 @@ class _StreamingCallback(RecognitionCallback):
                 self._handle_sentence(s)
         else:
             self._handle_sentence(sentence)
-    
+
     def _handle_sentence(self, sentence):
         if isinstance(sentence, dict):
             text = (sentence.get("text") or "").strip()
@@ -151,23 +91,17 @@ class _StreamingCallback(RecognitionCallback):
             return
         if is_end:
             logger.info(f"ASR 断句完成 [{self.client_id}]: '{text}'")
-            # 放入队列（线程安全）
             try:
-                self.result_queue.put_nowait(text)
+                self.queue.put_nowait(text)
             except asyncio.QueueFull:
-                logger.warning(f"队列已满，丢弃识别结果: {text}")
-
-asr_manager = ASRSessionManager()
+                logger.warning(f"队列已满，丢弃: {text}")
 
 # ---------- 翻译 ----------
 def translate_text(text: str, target_lang: str) -> str:
     if not text or not DASHSCOPE_API_KEY:
         return text
     target = LANG_MAP.get(target_lang, "en")
-    headers = {
-        "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": TRANSLATE_MODEL,
         "input": {"text": text, "source_lang": "auto", "target_lang": target}
@@ -175,11 +109,8 @@ def translate_text(text: str, target_lang: str) -> str:
     try:
         resp = requests.post(TRANSLATE_URL, headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
-            result = resp.json()
-            return result.get("output", {}).get("text", text)
-        else:
-            logger.error(f"翻译失败: {resp.text}")
-            return text
+            return resp.json().get("output", {}).get("text", text)
+        return text
     except Exception as e:
         logger.error(f"翻译异常: {e}")
         return text
@@ -200,8 +131,6 @@ def synthesize_speech(text: str) -> Optional[bytes]:
 async def lifespan(app: FastAPI):
     logger.info("🚀 同声传译服务器启动（阿里百炼 SDK 版）")
     yield
-    for cid in list(asr_manager.sessions.keys()):
-        asr_manager.close_session(cid)
     logger.info("🛑 服务器关闭")
 
 app = FastAPI(lifespan=lifespan)
@@ -219,36 +148,45 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     if room_id not in rooms:
         rooms[room_id] = {"clients": {}, "languages": {}}
     rooms[room_id]["clients"][client_id] = websocket
-    await broadcast_room_status(room_id)
 
-    # 创建 ASR 结果队列
-    result_queue = asyncio.Queue(maxsize=10)
-    asr_result_queues[client_id] = result_queue
+    # 创建队列
+    queue = asyncio.Queue(maxsize=10)
+    asr_queues[client_id] = queue
 
-    def on_error(msg):
-        """ASR 错误回调"""
-        asyncio.create_task(websocket.send_text(json.dumps({"type": "asr_error", "msg": msg})))
-
-    callback = asr_manager.create_session(client_id, result_queue, on_error)
-    if callback:
+    # 创建 ASR 会话
+    callback = StreamingCallback(client_id, queue)
+    try:
+        recognition = Recognition(
+            model=ASR_MODEL,
+            format="pcm",
+            sample_rate=16000,
+            callback=callback
+        )
+        recognition.start()
+        asr_queues[client_id] = queue
+        logger.info(f"✅ ASR 会话已创建: {client_id}")
         await websocket.send_text(json.dumps({"type": "asr_ready", "msg": "语音识别已就绪"}))
-    else:
-        await websocket.send_text(json.dumps({"type": "asr_error", "msg": "语音识别启动失败"}))
+    except Exception as e:
+        logger.error(f"ASR 启动失败: {e}")
+        await websocket.send_text(json.dumps({"type": "asr_error", "msg": f"ASR 启动失败: {e}"}))
+        recognition = None
 
-    # 启动后台任务处理 ASR 结果
-    async def process_asr_results():
+    # 后台任务：从队列取识别结果
+    async def process_queue():
         while True:
             try:
-                text = await result_queue.get()
-                if text is None:  # 停止信号
+                text = await queue.get()
+                if text is None:
                     break
-                await handle_asr_result(client_id, text, room_id)
+                # 在 WebSocket 还存活时处理
+                if room_id in rooms and client_id in rooms[room_id]["clients"]:
+                    await handle_asr_result(client_id, text, room_id)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"处理 ASR 结果失败: {e}")
+                logger.error(f"处理队列失败: {e}")
 
-    asr_task = asyncio.create_task(process_asr_results())
+    queue_task = asyncio.create_task(process_queue())
 
     try:
         while True:
@@ -267,63 +205,75 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 if not audio_b64:
                     continue
                 pcm_bytes = base64.b64decode(audio_b64)
-                asr_manager.send_audio(client_id, pcm_bytes)
+                if recognition:
+                    try:
+                        recognition.send_audio_frame(pcm_bytes)
+                    except Exception as e:
+                        logger.error(f"发送音频失败: {e}")
 
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
     finally:
-        # 停止 ASR 结果处理任务
-        asr_task.cancel()
+        # 清理
+        queue_task.cancel()
         try:
-            await asr_task
+            await queue_task
         except asyncio.CancelledError:
             pass
-        
-        # 清理
+
+        if recognition:
+            try:
+                recognition.stop()
+            except Exception as e:
+                logger.error(f"关闭 ASR 失败: {e}")
+
         if room_id in rooms:
             rooms[room_id]["clients"].pop(client_id, None)
             rooms[room_id]["languages"].pop(client_id, None)
             if not rooms[room_id]["clients"]:
                 del rooms[room_id]
-        asr_manager.close_session(client_id)
-        asr_result_queues.pop(client_id, None)
+
+        asr_queues.pop(client_id, None)
         await broadcast_room_status(room_id)
 
+# ---------- 处理识别结果 ----------
 async def handle_asr_result(client_id: str, text: str, room_id: str):
-    """处理 ASR 识别结果"""
     logger.info(f"📝 处理识别结果: {client_id} -> '{text}'")
-    
-    # 1. 发送给说话者自己
+
+    # 发送给说话者自己
     if room_id in rooms and client_id in rooms[room_id]["clients"]:
         speaker_ws = rooms[room_id]["clients"][client_id]
-        await speaker_ws.send_text(json.dumps({
-            "type": "asr_result",
-            "text": text
-        }))
-        logger.info(f"✅ 已发送 asr_result 给 {client_id}")
-    
-    # 2. 翻译给其他参会者
+        try:
+            await speaker_ws.send_text(json.dumps({
+                "type": "asr_result",
+                "text": text
+            }))
+            logger.info(f"✅ 已发送 asr_result 给 {client_id}")
+        except Exception as e:
+            logger.error(f"发送失败: {e}")
+
+    # 翻译给其他人
     target_langs = {
         cid: lang for cid, lang in rooms[room_id]["languages"].items()
         if cid != client_id
     }
     if target_langs:
-        logger.info(f"🔄 翻译给 {len(target_langs)} 个目标")
         tasks = []
         for target_cid, target_lang in target_langs.items():
             tasks.append(translate_and_synthesize(text, target_lang, target_cid, room_id, client_id))
         await asyncio.gather(*tasks)
 
+# ---------- 翻译 + TTS ----------
 async def translate_and_synthesize(text: str, target_lang: str,
                                    target_client_id: str, room_id: str,
                                    speaker_id: str):
     try:
         translated = translate_text(text, target_lang)
         logger.info(f"翻译 ({target_lang}): {translated}")
-        
+
         audio_bytes = synthesize_speech(translated)
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8') if audio_bytes else ""
-        
+
         if room_id in rooms and target_client_id in rooms[room_id]["clients"]:
             target_ws = rooms[room_id]["clients"][target_client_id]
             await target_ws.send_text(json.dumps({
@@ -335,8 +285,9 @@ async def translate_and_synthesize(text: str, target_lang: str,
             }))
             logger.info(f"✅ 已发送翻译给 {target_client_id}")
     except Exception as e:
-        logger.error(f"翻译合成失败: {e}", exc_info=True)
+        logger.error(f"翻译合成失败: {e}")
 
+# ---------- 广播状态 ----------
 async def broadcast_room_status(room_id: str):
     if room_id not in rooms:
         return
