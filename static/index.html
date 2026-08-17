@@ -31,6 +31,14 @@
             gap: 6px;
         }
         .header h1 { font-size: 20px; color: #7c9bff; letter-spacing: 1px; }
+        .header .roomTag {
+            font-size: 12px;
+            color: #6fa0cf;
+            background: #10203a;
+            border-radius: 20px;
+            padding: 2px 10px;
+            margin-left: 6px;
+        }
         .header .status { font-size: 14px; color: #aaa; }
         .header .status .count { color: #6fcf97; font-weight: 600; }
         .header .controls {
@@ -50,6 +58,7 @@
             outline: none;
         }
         .header .controls input:focus { border-color: #4a6cf7; }
+        .header .controls input:disabled { opacity: 0.5; cursor: not-allowed; }
         .header .controls select {
             background: #1e1e3a;
             color: #fff;
@@ -167,6 +176,10 @@
             font-size: 13px;
             border-bottom: 1px solid #0e0e24;
         }
+        .card .scroll .msg.live {
+            color: #9aa8d0;
+            font-style: italic;
+        }
         .card .scroll .msg:last-child { border-bottom: none; }
         .card .scroll .empty { color: #444; font-style: italic; font-size: 12px; }
         .toast {
@@ -190,7 +203,7 @@
 <body>
 
 <div class="header">
-    <h1>🎙️ 四人会谈</h1>
+    <h1>🎙️ 四人会谈<span class="roomTag" id="roomTag">room1</span></h1>
     <span class="status">👤 <span class="count" id="onlineCount">0</span>/4</span>
     <div class="controls">
         <input type="text" id="myName" placeholder="输入你的姓名" value="冯忠德">
@@ -217,10 +230,14 @@
 // ============================================================
 // 配置
 // ============================================================
-const ROOM_ID = 'room1';
+// 房间号从 URL 参数 ?room=xxx 读取，不再写死为 room1，
+// 这样不同的会谈可以用不同链接分开，不会互相串场。
+// 例如： https://your-app.onrender.com/?room=team-a
+const ROOM_ID = new URLSearchParams(window.location.search).get('room') || 'room1';
 const CARD_IDS = ['user1', 'user2', 'user3', 'user4'];
 
-let clientId = null;
+let clientId = null;       // 实际发给后端、作为房间内唯一标识的 id（带随机后缀，避免同名冲突）
+let displayName_ = null;   // 界面上展示的名字（用户输入的原始名字）
 let ws = null;
 let isConnected = false;
 let audioCtx = null;
@@ -231,9 +248,16 @@ let reconnectTimer = null;
 let waveformAnimId = null;
 let waveformData = {};
 let speakingMap = {};
-let myCardId = 'user1';
+let myCardId = null;
 let audioSendCount = 0;
 let myLanguage = 'zh';
+
+// 卡片分配表：clientId -> cardId。只要用户还在线，卡片位置和聊天记录
+// 保持不变；只有当某个用户离开时，才回收并重置他占用的那一张卡片。
+// 原来的实现是每次收到 room_status 就把 4 张卡片全部清空重画，
+// 导致任何人一进一出，所有人屏幕上的对话记录都会被清空。
+let cardAssignment = {};
+let usedCards = new Set();
 
 const cardGrid = document.getElementById('cardGrid');
 const actionBtn = document.getElementById('actionBtn');
@@ -243,6 +267,9 @@ const onlineCount = document.getElementById('onlineCount');
 const myNameInput = document.getElementById('myName');
 const langSelect = document.getElementById('langSelect');
 const toastEl = document.getElementById('toast');
+const roomTag = document.getElementById('roomTag');
+
+roomTag.textContent = ROOM_ID;
 
 // ============================================================
 // 初始化卡片
@@ -300,15 +327,36 @@ function setCardEmpty(id, empty) {
     }
 }
 
-function appendMessage(id, text) {
+// isLive=true 表示这是一条还在识别中的中间结果：如果上一条也是中间结果，
+// 就原地更新文字，而不是每个字都新增一行；等整句说完（isLive=false）
+// 再把这一行"定稿"。这样字幕体验类似打字机，而不是刷屏。
+function appendMessage(id, text, isLive) {
     const el = document.getElementById(`scroll-${id}`);
     if (!el) return;
     const empty = el.querySelector('.empty');
     if (empty) empty.remove();
-    const d = document.createElement('div');
-    d.className = 'msg';
-    d.textContent = text;
-    el.appendChild(d);
+
+    const liveEl = el.querySelector('.msg.live');
+    if (isLive) {
+        if (liveEl) {
+            liveEl.textContent = text;
+        } else {
+            const d = document.createElement('div');
+            d.className = 'msg live';
+            d.textContent = text;
+            el.appendChild(d);
+        }
+    } else {
+        if (liveEl) {
+            liveEl.textContent = text;
+            liveEl.classList.remove('live');
+        } else {
+            const d = document.createElement('div');
+            d.className = 'msg';
+            d.textContent = text;
+            el.appendChild(d);
+        }
+    }
     el.scrollTop = el.scrollHeight;
     while (el.children.length > 20) el.removeChild(el.firstChild);
 }
@@ -325,6 +373,10 @@ function updateConnBadge(online) {
         actionBtn.disabled = false;
         leaveBtn.disabled = true;
     }
+    // 连接期间姓名不可改：改名不会通知后端（后端把 client_id 当作房间内唯一身份），
+    // 之前的实现允许连接中改名，但下一次 room_status 广播就会把名字变回去，
+    // 用户会一直以为自己改名失败。干脆连接期间禁用输入框，离线时才能改。
+    myNameInput.disabled = online;
 }
 
 function updateOnlineCount(count) {
@@ -332,22 +384,39 @@ function updateOnlineCount(count) {
 }
 
 // ============================================================
-// 重置所有卡片（离开时使用）
+// 卡片分配 / 回收
 // ============================================================
+function getFreeCard() {
+    for (const id of CARD_IDS) {
+        if (!usedCards.has(id)) return id;
+    }
+    return null; // 房间已满（超过 4 人时，多出来的人不显示卡片）
+}
+
+function resetCard(id) {
+    updateCardName(id, id);
+    updateCardState(id, '⏳ 等待', 'waiting');
+    const card = document.getElementById(`card-${id}`);
+    if (card) card.className = 'card';
+    setCardEmpty(id, true);
+    resetWaveform(id);
+    const el = document.getElementById(`scroll-${id}`);
+    if (el) el.innerHTML = '<div class="empty">等待加入...</div>';
+}
+
+// 重置全部卡片和分配表——只在"我自己"离开/断线时调用，
+// 不要在收到别人进出的 room_status 广播时调用。
 function resetAllCards() {
-    CARD_IDS.forEach(id => {
-        updateCardName(id, id);
-        updateCardState(id, '⏳ 等待', 'waiting');
-        document.getElementById(`card-${id}`).className = 'card';
-        setCardEmpty(id, true);
-        resetWaveform(id);
-        // 清空消息
-        const el = document.getElementById(`scroll-${id}`);
-        if (el) {
-            el.innerHTML = '<div class="empty">等待加入...</div>';
-        }
-    });
+    CARD_IDS.forEach(id => resetCard(id));
+    cardAssignment = {};
+    usedCards = new Set();
     updateOnlineCount(0);
+}
+
+function displayNameOf(fullClientId) {
+    // clientId 格式为 "姓名#随机后缀"，界面上只展示姓名部分
+    const idx = fullClientId.lastIndexOf('#');
+    return idx > 0 ? fullClientId.slice(0, idx) : fullClientId;
 }
 
 // ============================================================
@@ -382,6 +451,11 @@ function updateWaveform(id, amplitude) {
             stateEl.textContent = '🎤 在线';
             stateEl.className = 'state online';
             if (cardEl) cardEl.className = 'card active';
+        } else if (usedCards.has(id)) {
+            // 这张卡片被别的在线用户占用着，只是当前没在说话
+            stateEl.textContent = '🎤 在线';
+            stateEl.className = 'state online';
+            if (cardEl) cardEl.className = 'card';
         } else {
             stateEl.textContent = '⏳ 等待';
             stateEl.className = 'state waiting';
@@ -394,19 +468,6 @@ function resetWaveform(id) {
     const bars = document.querySelectorAll(`#wave-${id} .bar`);
     bars.forEach(b => { b.style.height = '4px'; b.className = 'bar'; });
     speakingMap[id] = false;
-    const stateEl = document.getElementById(`state-${id}`);
-    const cardEl = document.getElementById(`card-${id}`);
-    if (stateEl) {
-        if (id === myCardId && isConnected) {
-            stateEl.textContent = '🎤 在线';
-            stateEl.className = 'state online';
-            if (cardEl) cardEl.className = 'card active';
-        } else {
-            stateEl.textContent = '⏳ 等待';
-            stateEl.className = 'state waiting';
-            if (cardEl) cardEl.className = 'card';
-        }
-    }
 }
 
 function startWaveformLoop() {
@@ -441,40 +502,44 @@ function feedAudioData(id, floatData) {
 }
 
 // ============================================================
-// 核心：根据后端返回的 clients 映射到卡片
+// 核心：根据后端返回的 clients 增量更新卡片（不再整体清空重画）
 // ============================================================
 function redrawAllCards(clients) {
-    CARD_IDS.forEach(id => {
-        const card = document.getElementById(`card-${id}`);
-        if (!card) return;
-        const defaultName = id === 'user1' ? 'user1' : id;
-        updateCardName(id, defaultName);
-        updateCardState(id, '⏳ 空位', 'waiting');
-        card.className = 'card';
-        setCardEmpty(id, true);
-        resetWaveform(id);
-        // 清空消息
-        const el = document.getElementById(`scroll-${id}`);
-        if (el) {
-            el.innerHTML = '<div class="empty">等待加入...</div>';
-        }
-    });
+    const onlineIds = new Set(clients.map(c => c.id));
 
-    const onlineUsers = clients || [];
-    onlineUsers.forEach((user, index) => {
-        if (index >= CARD_IDS.length) return;
-        const cardId = CARD_IDS[index];
-        const userId = user.id || `user${index + 1}`;
-        updateCardName(cardId, userId);
-        updateCardState(cardId, '🎤 在线', 'online');
-        document.getElementById(`card-${cardId}`).className = 'card active';
-        setCardEmpty(cardId, false);
-        if (userId === clientId) {
+    // 1. 回收已经离线用户占用的卡片（只重置这一张，不动其他卡片）
+    for (const cid of Object.keys(cardAssignment)) {
+        if (!onlineIds.has(cid)) {
+            const cardId = cardAssignment[cid];
+            resetCard(cardId);
+            usedCards.delete(cardId);
+            delete cardAssignment[cid];
+        }
+    }
+
+    // 2. 给新上线、还没分配卡片的用户分配一张空闲卡片；
+    //    已经分配过的用户位置和聊天记录保持不变。
+    clients.forEach(user => {
+        const uid = user.id;
+        if (!cardAssignment[uid]) {
+            const free = getFreeCard();
+            if (!free) return; // 超过 4 人，多出的人不显示（人数徽标仍会如实统计）
+            cardAssignment[uid] = free;
+            usedCards.add(free);
+            updateCardName(free, displayNameOf(uid));
+            updateCardState(free, '🎤 在线', 'online');
+            setCardEmpty(free, false);
+        }
+        const cardId = cardAssignment[uid];
+        document.getElementById(`card-${cardId}`).className =
+            (uid === clientId) ? 'card active' : 'card';
+
+        if (uid === clientId) {
             myCardId = cardId;
         }
     });
 
-    updateOnlineCount(onlineUsers.length);
+    updateOnlineCount(clients.length);
 }
 
 // ============================================================
@@ -482,10 +547,13 @@ function redrawAllCards(clients) {
 // ============================================================
 function connect() {
     const name = myNameInput.value.trim() || '我';
-    clientId = name;
+    displayName_ = name;
+    // 用"姓名#随机后缀"作为房间内唯一 id，避免两个人用同一个名字时
+    // 互相覆盖对方的连接（后端是用这个 id 作为 dict key 的）。
+    clientId = `${name}#${Math.random().toString(36).slice(2, 6)}`;
     myLanguage = langSelect.value;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws/${ROOM_ID}/${encodeURIComponent(clientId)}`;
+    const url = `${protocol}//${window.location.host}/ws/${encodeURIComponent(ROOM_ID)}/${encodeURIComponent(clientId)}`;
 
     updateConnBadge(false);
     showToast('🔄 连接中...');
@@ -495,13 +563,7 @@ function connect() {
         console.log('✅ WebSocket 连接已打开');
         isConnected = true;
         updateConnBadge(true);
-        showToast(`✅ ${clientId} 已加入 (语言: ${myLanguage})`);
-
-        myCardId = 'user1';
-        updateCardName('user1', clientId);
-        updateCardState('user1', '🎤 在线', 'online');
-        document.getElementById(`card-user1`).className = 'card active';
-        setCardEmpty('user1', false);
+        showToast(`✅ ${displayName_} 已加入 (语言: ${myLanguage})`);
 
         sendMsg({ type: 'set_language', target_lang: myLanguage });
 
@@ -512,33 +574,21 @@ function connect() {
     ws.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
-            console.log('收到消息:', data);
-            
+
             if (data.type === 'room_status') {
-                const clients = data.clients || [];
-                redrawAllCards(clients);
-                const myFound = clients.find(c => c.id === clientId);
-                if (myFound) {
-                    const myIndex = clients.indexOf(myFound);
-                    const myCard = CARD_IDS[myIndex] || 'user1';
-                    myCardId = myCard;
-                    updateCardName(myCard, myFound.id);
-                    updateCardState(myCard, '🎤 在线', 'online');
-                    document.getElementById(`card-${myCard}`).className = 'card active';
-                    setCardEmpty(myCard, false);
-                }
+                redrawAllCards(data.clients || []);
             } else if (data.type === 'translation') {
                 const text = data.text || '';
-                const from = data.from || '对方';
-                if (text) {
-                    appendMessage(myCardId || 'user1', `📢 ${from}: ${text}`);
+                const from = displayNameOf(data.from || '对方');
+                if (text && myCardId) {
+                    appendMessage(myCardId, `📢 ${from}: ${text}`, false);
                 }
                 if (data.audio) playAudio(data.audio);
             } else if (data.type === 'asr_result') {
                 const text = data.text || '';
+                const isEnd = !!data.is_end;
                 if (text && myCardId) {
-                    appendMessage(myCardId, '🎤 ' + text);
-                    console.log('✅ ASR 结果显示在卡片上:', text);
+                    appendMessage(myCardId, '🎤 ' + text, !isEnd);
                 }
             } else if (data.type === 'asr_ready') {
                 showToast('✅ ' + data.msg);
@@ -555,11 +605,9 @@ function connect() {
         isConnected = false;
         updateConnBadge(false);
         stopAudioCapture();
-        // 重置所有卡片
         resetAllCards();
-        // 重置自己的卡片
         clientId = null;
-        myCardId = 'user1';
+        myCardId = null;
         showToast('❌ 已断开');
         if (reconnectTimer) {
             clearTimeout(reconnectTimer);
@@ -592,8 +640,8 @@ async function startAudioCapture() {
             sampleRate: 16000
         });
         console.log('✅ AudioContext 采样率:', audioCtx.sampleRate);
-        
-        mediaStream = await navigator.mediaDevices.getUserMedia({ 
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 sampleRate: 16000,
                 channelCount: 1,
@@ -608,20 +656,20 @@ async function startAudioCapture() {
         processorNode.onaudioprocess = (ev) => {
             if (!isConnected) return;
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            
+
             const inputData = ev.inputBuffer.getChannelData(0);
-            
+
             let sum = 0;
             for (let i = 0; i < inputData.length; i++) {
                 sum += inputData[i] * inputData[i];
             }
             const rms = Math.sqrt(sum / inputData.length);
             if (rms < 0.005) return;
-            
+
             feedAudioData(myCardId || 'user1', inputData);
             const pcm = floatTo16BitPCM(inputData);
             const b64 = arrayBufferToBase64(pcm);
-            
+
             audioSendCount++;
             if (audioSendCount % 30 === 0) {
                 console.log('🎤 发送音频，音量:', rms.toFixed(4));
@@ -691,26 +739,18 @@ function playAudio(b64) {
 // 事件绑定
 // ============================================================
 actionBtn.addEventListener('click', connect);
-myNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+myNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !isConnected) connect(); });
 
 leaveBtn.addEventListener('click', () => {
-    // 1. 停止音频
     stopAudioCapture();
-    
-    // 2. 关闭 WebSocket
     if (ws) {
         ws.close();
     }
-    
-    // 3. 手动重置所有状态（不依赖服务端广播）
     isConnected = false;
     updateConnBadge(false);
     resetAllCards();
-    
-    // 4. 重置自己的变量
     clientId = null;
-    myCardId = 'user1';
-    
+    myCardId = null;
     showToast('👋 已离开房间');
 });
 
@@ -723,22 +763,11 @@ langSelect.addEventListener('change', () => {
     }
 });
 
-myNameInput.addEventListener('change', () => {
-    if (isConnected) {
-        const newName = myNameInput.value.trim() || '我';
-        clientId = newName;
-        if (myCardId) {
-            updateCardName(myCardId, newName);
-            showToast(`🔄 姓名更新为: ${newName}`);
-        }
-    }
-});
-
 // ============================================================
 // 启动
 // ============================================================
 startWaveformLoop();
-console.log('🎙️ 四人会谈已加载 (阿里百炼版)');
+console.log('🎙️ 四人会谈已加载 (阿里百炼版) - 房间:', ROOM_ID);
 </script>
 </body>
 </html>
