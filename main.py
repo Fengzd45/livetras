@@ -64,7 +64,36 @@ class StreamingCallback(RecognitionCallback):
 
     def on_error(self, result):
         self.is_broken = True
-        logger.error(f"ASR 错误: {result}")
+        # 修复：安全地处理错误信息
+        try:
+            error_msg = str(result) if result else "未知错误"
+            # 尝试获取错误码
+            if hasattr(result, 'status_code'):
+                error_msg = f"status_code={result.status_code}, {error_msg}"
+            if hasattr(result, 'message'):
+                error_msg = f"message={result.message}, {error_msg}"
+            logger.error(f"ASR 错误: {error_msg}")
+        except Exception as e:
+            logger.error(f"ASR 错误（无法解析详细信息）: {e}")
+        # 通知前端
+        asyncio.run_coroutine_threadsafe(
+            self._notify_error(error_msg),
+            self.loop
+        )
+
+    async def _notify_error(self, msg):
+        # 通过房间找到 WebSocket 发送错误
+        room_id = self.room_id
+        client_id = self.client_id
+        if room_id in rooms and client_id in rooms[room_id]["clients"]:
+            ws = rooms[room_id]["clients"][client_id]
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "asr_error",
+                    "msg": f"ASR 错误: {msg}"
+                }))
+            except Exception:
+                pass
 
     def on_event(self, result):
         try:
@@ -89,13 +118,12 @@ class StreamingCallback(RecognitionCallback):
             is_end = bool(getattr(sentence, "sentence_end", False))
         if not text:
             return
-        # 只要是识别结果就推送（不等待 sentence_end，减少延迟）
-        if text:
-            logger.info(f"ASR 识别 [{self.client_id}]: '{text}' (is_end={is_end})")
-            asyncio.run_coroutine_threadsafe(
-                handle_asr_result(self.client_id, text, self.room_id),
-                self.loop
-            )
+        # 实时推送识别结果（不等待结束）
+        logger.info(f"ASR 识别 [{self.client_id}]: '{text}' (is_end={is_end})")
+        asyncio.run_coroutine_threadsafe(
+            handle_asr_result(self.client_id, text, self.room_id),
+            self.loop
+        )
 
 # ---------- 翻译 ----------
 def translate_text(text: str, target_lang: str) -> str:
@@ -153,6 +181,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
     loop = asyncio.get_running_loop()
 
+    # 创建 ASR 会话
     callback = StreamingCallback(client_id, loop, room_id)
     recognition = None
     try:
@@ -161,9 +190,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             format="pcm",
             sample_rate=16000,
             callback=callback,
-            # === 延迟优化参数 ===
-            enable_intermediate_result=True,  # 启用中间结果
-            # vad_threshold=500,               # VAD 静音阈值（毫秒），模型可能不支持，保留注释
+            enable_intermediate_result=True,  # 启用中间结果，实时推送
         )
         recognition.start()
         logger.info(f"✅ ASR 会话已创建: {client_id}")
@@ -194,6 +221,23 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                         recognition.send_audio_frame(pcm_bytes)
                     except Exception as e:
                         logger.error(f"发送音频失败: {e}")
+                        # 如果会话已停止，尝试重建
+                        if "has stopped" in str(e):
+                            logger.info("ASR 会话已停止，尝试重建...")
+                            try:
+                                recognition.stop()
+                            except Exception:
+                                pass
+                            callback = StreamingCallback(client_id, loop, room_id)
+                            recognition = Recognition(
+                                model=ASR_MODEL,
+                                format="pcm",
+                                sample_rate=16000,
+                                callback=callback,
+                                enable_intermediate_result=True,
+                            )
+                            recognition.start()
+                            logger.info(f"✅ ASR 会话已重建: {client_id}")
 
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
