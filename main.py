@@ -44,18 +44,25 @@ LANG_MAP = {
 
 rooms: Dict[str, Dict] = {}
 
+# 所有阻塞式网络调用（requests / dashscope SDK 同步接口）都丢进这个线程池执行，
+# 避免卡住 asyncio 的单个事件循环，影响其他房间/其他用户。
+EXECUTOR_MAX_WORKERS = 16
+
+
 # ---------- ASR 回调 ----------
 class StreamingCallback(RecognitionCallback):
     def __init__(self, client_id: str, loop: asyncio.AbstractEventLoop, room_id: str):
         self.client_id = client_id
         self.loop = loop
         self.room_id = room_id
-        self.is_broken = False
+        self.is_broken = False  # 会话是否已经失效（断开/出错），供主循环主动检测并重建
 
     def on_open(self):
         logger.info(f"ASR 流式会话已建立: {self.client_id}")
 
     def on_close(self):
+        # 正常/异常关闭都要标记为 broken，否则外层只在 on_error 时才会尝试重建，
+        # 漏掉了"连接被服务端正常关闭但我们还想继续说话"的情况。
         self.is_broken = True
         logger.info(f"ASR 流式会话已关闭: {self.client_id}")
 
@@ -64,19 +71,29 @@ class StreamingCallback(RecognitionCallback):
 
     def on_error(self, result):
         self.is_broken = True
+        # 修复：原来 try 块里 str(result) 本身可能抛异常，
+        # 一旦走进 except 分支 error_msg 还没被赋值，就会在下面
+        # self._notify_error(error_msg) 触发 UnboundLocalError，
+        # 导致这条日志之后的清理/通知代码全部执行不到，
+        # 且异常发生在 dashscope 内部的后台线程里不会被任何人捕获。
+        error_msg = "未知错误"
         try:
             error_msg = str(result) if result else "未知错误"
             if hasattr(result, 'status_code'):
                 error_msg = f"status_code={result.status_code}, {error_msg}"
             if hasattr(result, 'message'):
                 error_msg = f"message={result.message}, {error_msg}"
-            logger.error(f"ASR 错误: {error_msg}")
         except Exception as e:
-            logger.error(f"ASR 错误（无法解析）: {e}")
-        asyncio.run_coroutine_threadsafe(
-            self._notify_error(error_msg),
-            self.loop
-        )
+            error_msg = f"无法解析错误详情: {e}"
+        logger.error(f"ASR 错误: {error_msg}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._notify_error(error_msg),
+                self.loop
+            )
+        except Exception as e:
+            logger.error(f"通知前端 ASR 错误失败: {e}")
 
     async def _notify_error(self, msg):
         room_id = self.room_id
@@ -114,19 +131,25 @@ class StreamingCallback(RecognitionCallback):
             is_end = bool(getattr(sentence, "sentence_end", False))
         if not text:
             return
-        # ✅ 只推送断句完成的最终结果（is_end=True）
+
         if is_end:
             logger.info(f"ASR 断句完成 [{self.client_id}]: '{text}'")
-            asyncio.run_coroutine_threadsafe(
-                handle_asr_result(self.client_id, text, self.room_id),
-                self.loop
-            )
         else:
-            # 中间结果只记录日志，不推送
             logger.info(f"ASR 中间结果 [{self.client_id}]: '{text}'")
 
-# ---------- 翻译 ----------
-def translate_text(text: str, target_lang: str) -> str:
+        # 中间结果只用于实时字幕展示（发给说话者自己），不触发翻译/TTS；
+        # 只有整句说完（sentence_end=True）才对其他人做翻译+合成。
+        # 之前的版本对每一个中间结果都会调用一次翻译API+TTS API，
+        # 一句话说到一半可能已经打了五六次请求，费用高、延迟大、
+        # 播放的语音还会前后重叠。
+        asyncio.run_coroutine_threadsafe(
+            handle_asr_result(self.client_id, text, self.room_id, is_end),
+            self.loop
+        )
+
+
+# ---------- 翻译（阻塞调用，需在线程池中执行） ----------
+def _translate_text_blocking(text: str, target_lang: str) -> str:
     if not text or not DASHSCOPE_API_KEY:
         return text
     target = LANG_MAP.get(target_lang, "en")
@@ -139,13 +162,20 @@ def translate_text(text: str, target_lang: str) -> str:
         resp = requests.post(TRANSLATE_URL, headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
             return resp.json().get("output", {}).get("text", text)
+        logger.error(f"翻译请求失败: status={resp.status_code}, body={resp.text[:300]}")
         return text
     except Exception as e:
         logger.error(f"翻译异常: {e}")
         return text
 
-# ---------- TTS ----------
-def synthesize_speech(text: str) -> Optional[bytes]:
+
+async def translate_text(text: str, target_lang: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _translate_text_blocking, text, target_lang)
+
+
+# ---------- TTS（阻塞调用，需在线程池中执行） ----------
+def _synthesize_speech_blocking(text: str) -> Optional[bytes]:
     if not text or not DASHSCOPE_API_KEY:
         return None
     try:
@@ -154,6 +184,12 @@ def synthesize_speech(text: str) -> Optional[bytes]:
     except Exception as e:
         logger.error(f"TTS 失败: {e}")
         return None
+
+
+async def synthesize_speech(text: str) -> Optional[bytes]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _synthesize_speech_blocking, text)
+
 
 # ---------- FastAPI ----------
 @asynccontextmanager
@@ -165,9 +201,27 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 @app.get("/")
 async def get_index():
     return FileResponse("static/index.html")
+
+
+def _create_recognition(callback: StreamingCallback) -> Recognition:
+    """创建并启动一个新的 ASR 流式会话。start() 是阻塞调用，
+    这里仍在事件循环线程里直接调用——它只在建立连接时执行一次，
+    耗时通常在百毫秒级，可以接受；如果观察到偶发卡顿，也可以
+    改成 run_in_executor。"""
+    recognition = Recognition(
+        model=ASR_MODEL,
+        format="pcm",
+        sample_rate=16000,
+        callback=callback,
+        enable_intermediate_result=True,
+    )
+    recognition.start()
+    return recognition
+
 
 @app.websocket("/ws/{room_id}/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
@@ -184,14 +238,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
     callback = StreamingCallback(client_id, loop, room_id)
     recognition = None
     try:
-        recognition = Recognition(
-            model=ASR_MODEL,
-            format="pcm",
-            sample_rate=16000,
-            callback=callback,
-            # 不启用中间结果推送，我们只关注 is_end=True 的最终结果
-        )
-        recognition.start()
+        recognition = _create_recognition(callback)
         logger.info(f"✅ ASR 会话已创建: {client_id}")
         await websocket.send_text(json.dumps({"type": "asr_ready", "msg": "语音识别已就绪"}))
     except Exception as e:
@@ -215,26 +262,34 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 if not audio_b64:
                     continue
                 pcm_bytes = base64.b64decode(audio_b64)
-                if recognition:
+
+                # 主动检测：一旦上次回调标记会话已失效（断线/出错/正常关闭），
+                # 在发送下一帧音频之前立刻重建，而不是等 send_audio_frame
+                # 抛出异常才被动发现——原来的写法在网络抖动后，
+                # 用户说的话可能要几十秒才会被发现"没在识别"，
+                # 期间的语音全部静默丢失。
+                if recognition is None or callback.is_broken:
                     try:
-                        recognition.send_audio_frame(pcm_bytes)
+                        if recognition:
+                            recognition.stop()
+                    except Exception:
+                        pass
+                    callback = StreamingCallback(client_id, loop, room_id)
+                    try:
+                        recognition = _create_recognition(callback)
+                        logger.info(f"✅ ASR 会话已重建（主动检测）: {client_id}")
                     except Exception as e:
-                        logger.error(f"发送音频失败: {e}")
-                        if "has stopped" in str(e):
-                            logger.info("ASR 会话已停止，尝试重建...")
-                            try:
-                                recognition.stop()
-                            except Exception:
-                                pass
-                            callback = StreamingCallback(client_id, loop, room_id)
-                            recognition = Recognition(
-                                model=ASR_MODEL,
-                                format="pcm",
-                                sample_rate=16000,
-                                callback=callback,
-                            )
-                            recognition.start()
-                            logger.info(f"✅ ASR 会话已重建: {client_id}")
+                        logger.error(f"ASR 重建失败: {e}")
+                        recognition = None
+                        continue
+
+                try:
+                    recognition.send_audio_frame(pcm_bytes)
+                except Exception as e:
+                    logger.error(f"发送音频失败: {e}")
+                    callback.is_broken = True
+                    # 不在这里同步重建，下一帧进来时会走上面的主动检测分支，
+                    # 避免在异常处理路径里再做一次可能失败的重建。
 
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
@@ -247,6 +302,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
         if room_id in rooms:
             rooms[room_id]["clients"].pop(client_id, None)
+            rooms[room_id]["languages"].pop(client_id, None)
             if not rooms[room_id]["clients"]:
                 await asyncio.sleep(5)
                 if room_id in rooms and not rooms[room_id]["clients"]:
@@ -254,10 +310,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             else:
                 await broadcast_room_status(room_id)
 
-# ---------- 处理识别结果 ----------
-async def handle_asr_result(client_id: str, text: str, room_id: str):
-    logger.info(f"📝 处理识别结果: {client_id} -> '{text}'")
 
+# ---------- 处理识别结果 ----------
+async def handle_asr_result(client_id: str, text: str, room_id: str, is_end: bool):
     if room_id not in rooms:
         logger.warning(f"房间 {room_id} 不存在")
         return
@@ -266,35 +321,41 @@ async def handle_asr_result(client_id: str, text: str, room_id: str):
         logger.warning(f"客户端 {client_id} 已离开")
         return
 
-    # 发送给说话者自己
+    # 无论是不是整句结束，都把文字实时发给说话者自己看（字幕滚动效果）
     speaker_ws = rooms[room_id]["clients"][client_id]
     try:
         await speaker_ws.send_text(json.dumps({
             "type": "asr_result",
-            "text": text
+            "text": text,
+            "is_end": is_end
         }))
-        logger.info(f"✅ 已发送 asr_result 给 {client_id}")
     except Exception as e:
-        logger.error(f"发送失败: {e}")
+        logger.error(f"发送识别结果失败: {e}")
 
-    # 翻译给其他人
+    # 只有整句说完才翻译+合成语音发给其他人
+    if not is_end:
+        return
+
     target_langs = {
         cid: lang for cid, lang in rooms[room_id]["languages"].items()
         if cid != client_id
     }
     if target_langs:
-        for target_cid, target_lang in target_langs.items():
-            await translate_and_synthesize(text, target_lang, target_cid, room_id, client_id)
+        await asyncio.gather(*[
+            translate_and_synthesize(text, target_lang, target_cid, room_id, client_id)
+            for target_cid, target_lang in target_langs.items()
+        ])
+
 
 # ---------- 翻译 + TTS ----------
 async def translate_and_synthesize(text: str, target_lang: str,
                                    target_client_id: str, room_id: str,
                                    speaker_id: str):
     try:
-        translated = translate_text(text, target_lang)
+        translated = await translate_text(text, target_lang)
         logger.info(f"翻译 ({target_lang}): {translated}")
 
-        audio_bytes = synthesize_speech(translated)
+        audio_bytes = await synthesize_speech(translated)
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8') if audio_bytes else ""
 
         if room_id in rooms and target_client_id in rooms[room_id]["clients"]:
@@ -306,9 +367,9 @@ async def translate_and_synthesize(text: str, target_lang: str,
                 "audio": audio_b64,
                 "lang": target_lang
             }))
-            logger.info(f"✅ 已发送翻译给 {target_client_id}")
     except Exception as e:
         logger.error(f"翻译合成失败: {e}")
+
 
 # ---------- 广播状态 ----------
 async def broadcast_room_status(room_id: str):
@@ -326,5 +387,5 @@ async def broadcast_room_status(room_id: str):
     for ws in clients.values():
         try:
             await ws.send_text(json.dumps(status))
-        except:
+        except Exception:
             pass

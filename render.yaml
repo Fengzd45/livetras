@@ -1,10 +1,15 @@
-services:
-  - type: web
-    name: livetras
-    runtime: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: DASHSCOPE_API_KEY
-        sync: false
+services:
+  - type: web
+    name: livetras
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      # runtime.txt 已经不被 Render 识别（2026 年起 Render 只认 PYTHON_VERSION
+      # 环境变量或 .python-version 文件），这里显式指定版本，优先级最高，
+      # 双保险防止以后又悄悄跑到默认的最新 Python 大版本上。
+      - key: PYTHON_VERSION
+        value: 3.11.11
