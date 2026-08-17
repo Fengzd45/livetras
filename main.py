@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import base64
 import asyncio
 import logging
@@ -47,6 +48,14 @@ rooms: Dict[str, Dict] = {}
 # 所有阻塞式网络调用（requests / dashscope SDK 同步接口）都丢进这个线程池执行，
 # 避免卡住 asyncio 的单个事件循环，影响其他房间/其他用户。
 EXECUTOR_MAX_WORKERS = 16
+
+# 音频保活看门狗：前端理论上会持续发送音频帧（哪怕是静音），
+# 但如果因为网络问题、浏览器切后台、麦克风异常等原因导致
+# 前端真的断供，阿里云 ASR 流式连接会在约 23 秒无数据后自己超时断开。
+# 与其被动等阿里云那边判超时，不如服务端自己主动监控每个连接
+# "多久没收到音频帧了"，提前重建 ASR 会话，把断线时间压到最短。
+WATCHDOG_CHECK_INTERVAL = 5    # 每隔几秒检查一次
+WATCHDOG_IDLE_TIMEOUT = 15     # 超过这么久没收到音频帧，判定为需要重建（留出安全余量，早于阿里云的 23 秒）
 
 
 # ---------- ASR 回调 ----------
@@ -208,10 +217,7 @@ async def get_index():
 
 
 def _create_recognition(callback: StreamingCallback) -> Recognition:
-    """创建并启动一个新的 ASR 流式会话。start() 是阻塞调用，
-    这里仍在事件循环线程里直接调用——它只在建立连接时执行一次，
-    耗时通常在百毫秒级，可以接受；如果观察到偶发卡顿，也可以
-    改成 run_in_executor。"""
+    """创建并启动一个新的 ASR 流式会话（阻塞调用）。"""
     recognition = Recognition(
         model=ASR_MODEL,
         format="pcm",
@@ -221,6 +227,76 @@ def _create_recognition(callback: StreamingCallback) -> Recognition:
     )
     recognition.start()
     return recognition
+
+
+def _stop_recognition_blocking(recognition: Recognition):
+    try:
+        recognition.stop()
+    except Exception as e:
+        logger.error(f"关闭 ASR 会话失败: {e}")
+
+
+class ConnectionState:
+    """持有某个 WebSocket 连接当前的 ASR 会话状态。
+    用一个可变对象包起来，是因为看门狗任务和主消息循环是两个
+    并发运行的协程，都需要读取/替换同一个 recognition 对象——
+    如果只用局部变量，看门狗那边根本没法把"重建后的新 recognition"
+    同步给主循环使用。"""
+    __slots__ = ("recognition", "callback", "last_audio_time")
+
+    def __init__(self):
+        self.recognition: Optional[Recognition] = None
+        self.callback: Optional[StreamingCallback] = None
+        self.last_audio_time: float = time.monotonic()
+
+
+async def rebuild_recognition(state: ConnectionState, client_id: str, room_id: str,
+                               loop: asyncio.AbstractEventLoop, reason: str):
+    """停掉旧的 ASR 会话（如果有）并重新创建一个。
+    start/stop 都是阻塞调用，丢进线程池执行，不卡事件循环。"""
+    old_recognition = state.recognition
+    if old_recognition is not None:
+        await loop.run_in_executor(None, _stop_recognition_blocking, old_recognition)
+
+    new_callback = StreamingCallback(client_id, loop, room_id)
+    try:
+        new_recognition = await loop.run_in_executor(None, _create_recognition, new_callback)
+    except Exception as e:
+        logger.error(f"ASR 重建失败（{reason}）: {e}")
+        state.recognition = None
+        state.callback = new_callback
+        return
+
+    state.recognition = new_recognition
+    state.callback = new_callback
+    state.last_audio_time = time.monotonic()
+    logger.info(f"✅ ASR 会话已重建（{reason}）: {client_id}")
+
+
+async def audio_watchdog(state: ConnectionState, client_id: str, room_id: str,
+                          loop: asyncio.AbstractEventLoop):
+    """后台常驻任务：定期检查这个连接多久没收到音频帧了。
+    如果前端因为某种原因真的停止发送音频（网络问题、切后台、
+    麦克风掉线等），与其等阿里云那边约 23 秒超时才发现，
+    不如服务端自己提前判定并重建，缩短用户感知到的中断时间。"""
+    try:
+        while True:
+            await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+
+            if state.recognition is None:
+                # 还没建立过，或者上一次重建失败了——留给主循环下次
+                # 收到音频帧时自然触发重建，看门狗这里不重复处理。
+                continue
+
+            idle = time.monotonic() - state.last_audio_time
+            if idle > WATCHDOG_IDLE_TIMEOUT and not (state.callback and state.callback.is_broken):
+                logger.warning(
+                    f"⏰ {client_id} 已 {idle:.1f}s 未收到音频帧，"
+                    f"主动重建 ASR 会话（避免被动等待阿里云侧超时）"
+                )
+                await rebuild_recognition(state, client_id, room_id, loop, reason="看门狗检测到音频中断")
+    except asyncio.CancelledError:
+        pass
 
 
 @app.websocket("/ws/{room_id}/{client_id}")
@@ -235,15 +311,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
     loop = asyncio.get_running_loop()
 
-    callback = StreamingCallback(client_id, loop, room_id)
-    recognition = None
+    state = ConnectionState()
     try:
-        recognition = _create_recognition(callback)
+        state.callback = StreamingCallback(client_id, loop, room_id)
+        state.recognition = await loop.run_in_executor(None, _create_recognition, state.callback)
+        state.last_audio_time = time.monotonic()
         logger.info(f"✅ ASR 会话已创建: {client_id}")
         await websocket.send_text(json.dumps({"type": "asr_ready", "msg": "语音识别已就绪"}))
     except Exception as e:
         logger.error(f"ASR 启动失败: {e}")
         await websocket.send_text(json.dumps({"type": "asr_error", "msg": f"ASR 启动失败: {e}"}))
+
+    watchdog_task = asyncio.create_task(audio_watchdog(state, client_id, room_id, loop))
 
     try:
         while True:
@@ -262,43 +341,36 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 if not audio_b64:
                     continue
                 pcm_bytes = base64.b64decode(audio_b64)
+                state.last_audio_time = time.monotonic()
 
                 # 主动检测：一旦上次回调标记会话已失效（断线/出错/正常关闭），
                 # 在发送下一帧音频之前立刻重建，而不是等 send_audio_frame
-                # 抛出异常才被动发现——原来的写法在网络抖动后，
-                # 用户说的话可能要几十秒才会被发现"没在识别"，
-                # 期间的语音全部静默丢失。
-                if recognition is None or callback.is_broken:
-                    try:
-                        if recognition:
-                            recognition.stop()
-                    except Exception:
-                        pass
-                    callback = StreamingCallback(client_id, loop, room_id)
-                    try:
-                        recognition = _create_recognition(callback)
-                        logger.info(f"✅ ASR 会话已重建（主动检测）: {client_id}")
-                    except Exception as e:
-                        logger.error(f"ASR 重建失败: {e}")
-                        recognition = None
+                # 抛出异常才被动发现。这一路是"还有音频在发、但会话坏了"的情况；
+                # 下面的 audio_watchdog 负责另一种情况："音频根本没发过来"。
+                if state.recognition is None or state.callback.is_broken:
+                    await rebuild_recognition(state, client_id, room_id, loop, reason="主动检测")
+                    if state.recognition is None:
                         continue
 
                 try:
-                    recognition.send_audio_frame(pcm_bytes)
+                    await loop.run_in_executor(None, state.recognition.send_audio_frame, pcm_bytes)
                 except Exception as e:
                     logger.error(f"发送音频失败: {e}")
-                    callback.is_broken = True
+                    state.callback.is_broken = True
                     # 不在这里同步重建，下一帧进来时会走上面的主动检测分支，
                     # 避免在异常处理路径里再做一次可能失败的重建。
 
     except WebSocketDisconnect:
         logger.info(f"❌ 客户端 {client_id} 断开连接")
     finally:
-        if recognition:
-            try:
-                recognition.stop()
-            except Exception as e:
-                logger.error(f"关闭 ASR 失败: {e}")
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+
+        if state.recognition:
+            await loop.run_in_executor(None, _stop_recognition_blocking, state.recognition)
 
         if room_id in rooms:
             rooms[room_id]["clients"].pop(client_id, None)
