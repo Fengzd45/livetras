@@ -64,25 +64,21 @@ class StreamingCallback(RecognitionCallback):
 
     def on_error(self, result):
         self.is_broken = True
-        # 修复：安全地处理错误信息
         try:
             error_msg = str(result) if result else "未知错误"
-            # 尝试获取错误码
             if hasattr(result, 'status_code'):
                 error_msg = f"status_code={result.status_code}, {error_msg}"
             if hasattr(result, 'message'):
                 error_msg = f"message={result.message}, {error_msg}"
             logger.error(f"ASR 错误: {error_msg}")
         except Exception as e:
-            logger.error(f"ASR 错误（无法解析详细信息）: {e}")
-        # 通知前端
+            logger.error(f"ASR 错误（无法解析）: {e}")
         asyncio.run_coroutine_threadsafe(
             self._notify_error(error_msg),
             self.loop
         )
 
     async def _notify_error(self, msg):
-        # 通过房间找到 WebSocket 发送错误
         room_id = self.room_id
         client_id = self.client_id
         if room_id in rooms and client_id in rooms[room_id]["clients"]:
@@ -118,12 +114,16 @@ class StreamingCallback(RecognitionCallback):
             is_end = bool(getattr(sentence, "sentence_end", False))
         if not text:
             return
-        # 实时推送识别结果（不等待结束）
-        logger.info(f"ASR 识别 [{self.client_id}]: '{text}' (is_end={is_end})")
-        asyncio.run_coroutine_threadsafe(
-            handle_asr_result(self.client_id, text, self.room_id),
-            self.loop
-        )
+        # ✅ 只推送断句完成的最终结果（is_end=True）
+        if is_end:
+            logger.info(f"ASR 断句完成 [{self.client_id}]: '{text}'")
+            asyncio.run_coroutine_threadsafe(
+                handle_asr_result(self.client_id, text, self.room_id),
+                self.loop
+            )
+        else:
+            # 中间结果只记录日志，不推送
+            logger.info(f"ASR 中间结果 [{self.client_id}]: '{text}'")
 
 # ---------- 翻译 ----------
 def translate_text(text: str, target_lang: str) -> str:
@@ -181,7 +181,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
     loop = asyncio.get_running_loop()
 
-    # 创建 ASR 会话
     callback = StreamingCallback(client_id, loop, room_id)
     recognition = None
     try:
@@ -190,7 +189,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             format="pcm",
             sample_rate=16000,
             callback=callback,
-            enable_intermediate_result=True,  # 启用中间结果，实时推送
+            # 不启用中间结果推送，我们只关注 is_end=True 的最终结果
         )
         recognition.start()
         logger.info(f"✅ ASR 会话已创建: {client_id}")
@@ -221,7 +220,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                         recognition.send_audio_frame(pcm_bytes)
                     except Exception as e:
                         logger.error(f"发送音频失败: {e}")
-                        # 如果会话已停止，尝试重建
                         if "has stopped" in str(e):
                             logger.info("ASR 会话已停止，尝试重建...")
                             try:
@@ -234,7 +232,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                                 format="pcm",
                                 sample_rate=16000,
                                 callback=callback,
-                                enable_intermediate_result=True,
                             )
                             recognition.start()
                             logger.info(f"✅ ASR 会话已重建: {client_id}")
